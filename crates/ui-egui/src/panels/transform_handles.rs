@@ -441,7 +441,11 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                 moved = snapped;
                 crate::panels::monitor_view::draw_snap_lines(ui.painter(), pic, &lines);
             }
-            if resp.drag_started_by(left) || resp.drag_delta() != egui::Vec2::ZERO {
+            // (also when only the snapping changed: ⌘/Ctrl pressed or released with the pointer still)
+            let moved_id = id.with("moved");
+            let last: Option<egui::Vec2> = ui.data(|m| m.get_temp(moved_id));
+            if resp.drag_started_by(left) || resp.drag_delta() != egui::Vec2::ZERO || last.is_some_and(|l| l != moved) {
+                ui.data_mut(|m| m.insert_temp(moved_id, moved));
                 for (param, value) in changes(&d, def.id, cur, moved) {
                     actions.push(("effects.setParam".into(), json!({"clip": sel.0.0, "effect": sel.1, "param": param, "value": value, "merge": MERGE})));
                 }
@@ -453,7 +457,10 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
             cursor(ui, &pl, grab, p, pic);
         }
         if resp.drag_stopped() {
-            ui.data_mut(|d| d.remove::<Drag>(drag_id));
+            ui.data_mut(|d| {
+                d.remove::<Drag>(drag_id);
+                d.remove::<egui::Vec2>(id.with("moved"));
+            });
         }
         // a click beside the box (not on it, a handle or a corner's rotate zone) lets go of it
         if resp.clicked() && !double && resp.interact_pointer_pos().is_some_and(|p| grab_at(&pl, p).is_none()) {
