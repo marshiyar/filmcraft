@@ -1055,6 +1055,14 @@ pub(super) fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence
         }
     }
 
+    // ---- double-click a marker on the ruler: the Edit Marker dialog (#3023)
+    if resp.double_clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+        && let Some(marker) = marker_under_pointer(seq, layout, p)
+    {
+        super::marker_dialog::open(app, &ctx, marker.id);
+    }
+
     // ---- double-click a transition: Set Transition Duration (Premiere)
     if resp.double_clicked()
         && tool == Tool::Selection
