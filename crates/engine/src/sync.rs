@@ -23,6 +23,8 @@ use crate::{EngineError, Result, Session};
 
 /// Sample rate audio is analysed at.
 pub const ANALYSIS_RATE: u32 = 48_000;
+/// Seconds of audio decoded per read while analysing (bounds the buffer, whatever the channel count).
+const ANALYSIS_CHUNK_SECONDS: u64 = 60;
 /// Longest stretch of a clip analysed for audio sync (from its start).
 pub const MAX_ANALYSIS: Tick = Tick(30 * 60 * TICKS_PER_SECOND);
 
@@ -131,9 +133,26 @@ pub fn clip_audio(s: &Session, c: &SyncClip) -> Option<Vec<f32>> {
     let sr = ANALYSIS_RATE as i64;
     let start = c.range.start.to_units_floor(sr);
     let len = c.range.duration.min(MAX_ANALYSIS).to_units_floor(sr).max(0) as usize;
-    let buf = src.audio(start, len, ANALYSIS_RATE).ok()?;
-    let chans: Vec<&[f32]> = buf.channels.iter().map(|c| c.as_slice()).collect();
-    Some(mixdown(&chans))
+    // Read in short chunks and mix each down to mono: one read of the whole range is a planar
+    // buffer of channels x length, which for stereo over ~23 minutes exceeds the audio buffer
+    // limit and failed as "no audio" (#3554).
+    let chunk = (ANALYSIS_CHUNK_SECONDS * ANALYSIS_RATE as u64) as usize;
+    let mut mono: Vec<f32> = Vec::with_capacity(len);
+    let mut done = 0usize;
+    while done < len {
+        let n = chunk.min(len - done);
+        let buf = src.audio(start.checked_add(done as i64)?, n, ANALYSIS_RATE).ok()?;
+        let chans: Vec<&[f32]> = buf.channels.iter().map(|c| c.as_slice()).collect();
+        let part = mixdown(&chans);
+        let short = part.len() < n;
+        mono.extend(part);
+        if short {
+            // the media ended inside this chunk: keep later samples from shifting earlier
+            break;
+        }
+        done += n;
+    }
+    Some(mono)
 }
 
 /// The outcome for one clip: its anchor, and for audio the correlation figures.
