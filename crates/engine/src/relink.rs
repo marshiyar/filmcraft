@@ -541,6 +541,21 @@ pub fn search(s: &Session, p: &Value) -> Result<Value> {
     Ok(json!({"results": out}))
 }
 
+/// Whether Make Offline ▸ delete may remove `path` for item `id`: a regular file (not a link or
+/// a folder) with a media extension, whose size and fingerprint equal the ones recorded when the
+/// item was imported or linked. An item with no recorded identity (older projects) is held to
+/// the first two checks only.
+fn deletable_media(s: &Session, id: ItemId, path: &str) -> bool {
+    let p = Path::new(path);
+    if !filmcraft_media::is_importable(p) || !std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    match s.project.item(id).and_then(|i| i.as_media()).and_then(|m| m.identity) {
+        Some(want) => identity_of(&*s.services, path).is_ok_and(|have| have == want),
+        None => true,
+    }
+}
+
 /// `media.makeOffline {items?, deleteFiles?}`.
 pub fn make_offline(s: &mut Session, p: &Value) -> Result<Value> {
     let items: Vec<ItemId> = match p.get("items").and_then(Value::as_array) {
@@ -568,10 +583,12 @@ pub fn make_offline(s: &mut Session, p: &Value) -> Result<Value> {
     })?;
     let mut deleted = Vec::new();
     if delete {
-        for (_, path) in &files {
+        for (id, path) in &files {
             // Stored paths in an opened document are not authority to delete arbitrary files.
-            // Delete only the resolved path that the media pool permits opening.
+            // Delete only the resolved path that the media pool permits opening, and only when
+            // it is a regular media file that is still the one the item was linked to.
             if let Ok(path) = s.media.follow(path)
+                && deletable_media(s, *id, &path)
                 && std::fs::remove_file(&path).is_ok()
             {
                 deleted.push(path.clone());
