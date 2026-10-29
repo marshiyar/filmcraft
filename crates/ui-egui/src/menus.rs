@@ -180,16 +180,10 @@ pub fn targets_source(app: &FilmcraftApp, params: &Value) -> bool {
     }
 }
 
-/// The speed after J (`dir` -1) or L (`dir` +1) while the clock runs at `current` (`None` when it is
-/// stopped), as in Premiere Pro: the same direction doubles the speed up to 8×, the opposite one steps
-/// it down a notch and keeps the direction (8× to 4× to 2× to 1×); at 1× or slower it turns around at
-/// 1× (#3234).
+/// The speed after J / L in the Program and Source monitors; the ladder is shared with dynamic
+/// trimming, see [`filmcraft_engine::trim::shuttle_speed`] (#3234).
 pub(crate) fn shuttle_speed(current: Option<f64>, dir: f64) -> f64 {
-    match current.filter(|s| s.is_finite() && *s != 0.0) {
-        Some(s) if s * dir > 0.0 => (s * 2.0).clamp(-8.0, 8.0),
-        Some(s) if s.abs() > 1.0 => s.signum() * (s.abs() / 2.0).max(1.0),
-        _ => dir,
-    }
+    filmcraft_engine::trim::shuttle_speed(current, dir)
 }
 
 /// Execute a UI or engine command by id.
