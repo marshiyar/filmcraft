@@ -707,14 +707,50 @@ pub fn save_screenshot_with_ppp(image: &egui::ColorImage, path: Option<&str>, cr
             Err(e) => json!({"ok": false, "error": e}),
         };
     }
-    let path = path.map(str::to_string).unwrap_or_else(|| filmcraft_engine::temp_dir().join("filmcraft-screenshot.png").to_string_lossy().to_string());
     match encode_png(&rgba, cw as u32, ch as u32) {
-        Ok(png) => match std::fs::write(&path, png) {
-            Ok(()) => json!({"ok": true, "result": {"path": path, "width": cw, "height": ch}}),
+        Ok(png) => match write_screenshot(&png, path) {
+            Ok(path) => json!({"ok": true, "result": {"path": path, "width": cw, "height": ch}}),
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         },
         Err(e) => json!({"ok": false, "error": e}),
     }
+}
+
+/// Write the PNG and return where it went. Without a `path` it goes to a new, uniquely named file
+/// in the temp folder, created exclusively (an existing file or link there is never opened) and
+/// private to the user; a fixed name in a shared temp folder could be pre-created as a link by
+/// another local user to redirect the write. An explicit `path` is the caller's choice, but a
+/// link at that path is refused rather than followed.
+fn write_screenshot(png: &[u8], path: Option<&str>) -> std::io::Result<String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    if let Some(path) = path {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(std::io::Error::other(format!("{path} is a symbolic link; refusing to write through it")));
+        }
+        std::fs::write(path, png)?;
+        return Ok(path.to_string());
+    }
+    let dir = filmcraft_engine::temp_dir();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    for _ in 0..100 {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!("filmcraft-screenshot-{}-{nanos:x}-{n}.png", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&candidate) {
+            Ok(mut file) => {
+                file.write_all(png)?;
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("could not create a private screenshot file"))
 }
 
 /// Standard base64 (RFC 4648, with padding).
@@ -931,6 +967,33 @@ mod base64_tests {
             let err = super::crop_pixels([8, 8], Some(crop), 1.0).expect_err("an invalid crop must be refused");
             assert!(err.contains("finite rectangle"), "{err}");
         }
+    }
+
+    /// The default screenshot file is new and private each time, and an explicit path that is a link
+    /// is not written through (#2808).
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_files_are_exclusive_and_do_not_follow_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let a = super::write_screenshot(b"one", None).unwrap();
+        let b = super::write_screenshot(b"two", None).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = (std::fs::remove_file(&a), std::fs::remove_file(&b));
+
+        let dir = std::env::temp_dir().join(format!("fc-shot-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        let link = dir.join("shot.png");
+        symlink(&victim, &link).unwrap();
+        assert!(super::write_screenshot(b"png", Some(&link.to_string_lossy())).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep", "the link target was overwritten");
+        let plain = dir.join("plain.png");
+        assert_eq!(super::write_screenshot(b"png", Some(&plain.to_string_lossy())).unwrap(), plain.to_string_lossy());
+        assert_eq!(std::fs::read(&plain).unwrap(), b"png");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

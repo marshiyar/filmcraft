@@ -360,3 +360,28 @@ fn saved_projects_are_listed_in_home_and_open_recent() {
     assert!(!menus.as_array().unwrap().iter().any(|m| m["id"].as_str().is_some_and(|id| id.starts_with("file.openRecent."))));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Edit Original on an offline item whose path is not a local media file never hands that path to
+/// the OS opener (#2783): a URL is refused, a script opens only its folder.
+#[test]
+fn edit_original_does_not_open_non_media_paths() {
+    let dir = std::env::temp_dir().join(format!("fc-ui-editorig-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("run.command");
+    std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+    let png = dir.join("real.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255])).save(&png).unwrap();
+    let mut d = Driver::new();
+    for bad in [script.to_string_lossy().into_owned(), "https://example.com/a.mp4".to_string()] {
+        let item = d.exec("file.import", json!({"paths": [png.to_string_lossy()]}))["items"][0].as_u64().unwrap();
+        // a project file from someone else can name any string as an item's media
+        let it = std::sync::Arc::make_mut(&mut d.app().session.project).item_mut(filmcraft_engine::project::ItemId(item)).unwrap();
+        let filmcraft_engine::project::ItemKind::Media(clip) = &mut it.kind else { panic!("imported item is not media") };
+        clip.media = filmcraft_engine::project::MediaRef::File { path: bad.clone() };
+        d.exec("project.select", json!({"items": [item]}));
+        let r = d.call("ui.menu.invoke", json!({"id": "edit.editOriginal"}));
+        let opened = d.app().ui.extras.opened.clone();
+        assert!(!opened.contains(&bad), "{bad} reached the opener: {opened:?} / {r}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
