@@ -2147,9 +2147,15 @@ fn build() -> Vec<CommandSpec> {
         }),
         cmd!("sequence.close", "Close Sequence", [], None, r#"{"item":id?}"#, has_seq, |s, p| {
             let id = item_p(p, "item").or(s.state.active_sequence).ok_or(EngineError::NoSequence)?;
+            let was_open = s.state.open_sequences.contains(&id);
             s.state.open_sequences.retain(|x| *x != id);
             if s.state.active_sequence == Some(id) {
                 s.state.active_sequence = s.state.open_sequences.last().copied();
+            }
+            // an empty Timeline looks like lost work (#3351): say the sequence is still in the project
+            if was_open && s.state.open_sequences.is_empty() {
+                let name = s.project.item(id).map(|i| i.name.clone()).unwrap_or_default();
+                s.toast(format!("Closed sequence \"{name}\". Nothing was deleted: open it again from the Project panel (double-click it)."));
             }
             Ok(Value::Null)
         }),
