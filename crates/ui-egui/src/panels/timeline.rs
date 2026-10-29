@@ -146,6 +146,18 @@ pub struct Pressed {
     pub grab: Grab,
 }
 
+/// Where a box selection began, in Timeline content coordinates: the time under the pointer, and
+/// its y with the vertical scroll it was pressed at. Scrolling (wheel, auto-scroll, the bars)
+/// then moves the corner with the clips rather than leaving it at its screen position (#3563).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarqueeAnchor {
+    pub t: Tick,
+    pub y: f32,
+    pub v_scroll: f32,
+    /// Pressed over the video tracks, which move with `v_scroll`; the audio tracks do not.
+    pub video: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Drag {
     Scrub {
@@ -235,7 +247,7 @@ pub enum Drag {
     /// Box selection, shown live: `before` is the selection when the drag began, which Shift or
     /// Ctrl (`add`) keep; the release commits one `timeline.select`.
     Marquee {
-        start: Pos2,
+        start: MarqueeAnchor,
         before: Vec<ClipId>,
         add: bool,
         individual: bool,

@@ -3,9 +3,9 @@ use super::layout::{Layout, max_scroll, new_track_at};
 use super::menus::{CLIP_MENU, EditPointTarget, edit_point_menu, gap_menu, marker_menu, multicam_menu};
 use super::snap::{snap, snap_playhead};
 use super::{
-    Align2, ClipId, Color32, CursorIcon, Drag, EdgeKind, FilmcraftApp, Grab, HashMap, Hit, MarkerId, Pos2, Pressed, Rect, Sense, Sequence, Stroke, StrokeKind,
-    Tick, Tokens, Tool, TrackId, TrackItem, TrackKind, Value, edge_geometry, grab_at, hit, json, marker_at, marker_under_pointer, pos2, selection_trim_kind,
-    vec2,
+    Align2, ClipId, Color32, CursorIcon, Drag, EdgeKind, FilmcraftApp, Grab, HashMap, Hit, MarkerId, MarqueeAnchor, Pos2, Pressed, Rect, Sense, Sequence,
+    Stroke, StrokeKind, Tick, Tokens, Tool, TrackId, TrackItem, TrackKind, Value, edge_geometry, grab_at, hit, json, marker_at, marker_under_pointer, pos2,
+    selection_trim_kind, vec2,
 };
 
 pub(super) fn preview_drag(
@@ -111,6 +111,18 @@ pub(super) fn move_transition_preview(app: &FilmcraftApp, seq: &Sequence, trn: &
 }
 
 /// The clips a marquee rectangle touches, on the tracks it crosses.
+impl MarqueeAnchor {
+    pub(super) fn new(layout: &Layout, v_scroll: f32, p: Pos2) -> Self {
+        MarqueeAnchor { t: layout.tick_at(p.x), y: p.y, v_scroll, video: p.y < layout.split_y }
+    }
+
+    /// The box from this corner, wherever it is on screen now, to the pointer at `p`.
+    pub(super) fn rect_to(&self, layout: &Layout, v_scroll: f32, p: Pos2) -> Rect {
+        let y = if self.video { self.y + (v_scroll - self.v_scroll) } else { self.y };
+        Rect::from_two_pos(pos2(layout.x_of(self.t), y), p)
+    }
+}
+
 fn marquee_clips(seq: &Sequence, layout: &Layout, r: Rect) -> Vec<ClipId> {
     let (a, b) = (layout.tick_at(r.min.x), layout.tick_at(r.max.x));
     layout
@@ -487,7 +499,12 @@ fn start_drag(app: &mut FilmcraftApp, ctx: &egui::Context, resp: &egui::Response
         // the video and audio tracks, #683)
         (_, Grab::Other(hit @ (Hit::Empty { .. } | Hit::None))) if layout.content.contains(p) => {
             if resp.drag_started() {
-                Some(Drag::Marquee { start: p, before: app.session.state.selection.clone(), add: mods.shift || mods.command, individual: mods.alt })
+                Some(Drag::Marquee {
+                    start: MarqueeAnchor::new(layout, app.ui.timeline.v_scroll, p),
+                    before: app.session.state.selection.clone(),
+                    add: mods.shift || mods.command,
+                    individual: mods.alt,
+                })
             } else {
                 app.session.state.selection.clear();
                 app.session.state.edit_points.clear();
@@ -671,7 +688,7 @@ fn drag_update(app: &mut FilmcraftApp, ui: &mut egui::Ui, resp: &egui::Response,
             }
             Drag::Volume(v) => Some(Drag::Volume(crate::panels::timeline_volume::drag(app, ui, seq, layout, v, p.y))),
             Drag::Marquee { start, before, add, individual } => {
-                let r = Rect::from_two_pos(start, p);
+                let r = start.rect_to(layout, app.ui.timeline.v_scroll, p);
                 ui.painter().rect_filled(r, 0.0, Color32::from_white_alpha(18));
                 ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_white_alpha(140)), StrokeKind::Inside);
                 // the clips in the box are selected as it grows and shrinks; only the release runs
@@ -757,7 +774,7 @@ fn commit_drag(app: &mut FilmcraftApp, ctx: &egui::Context, resp: &egui::Respons
                     // egui ends a drag on Escape: that cancels the box, as in the Project panel
                     match resp.interact_pointer_pos() {
                         Some(end) if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) => {
-                            let ids: Vec<u64> = marquee_clips(seq, layout, Rect::from_two_pos(start, end)).iter().map(|c| c.0).collect();
+                            let ids: Vec<u64> = marquee_clips(seq, layout, start.rect_to(layout, app.ui.timeline.v_scroll, end)).iter().map(|c| c.0).collect();
                             Some(app.session.execute("timeline.select", json!({"clips": ids, "add": add, "linked": !individual})))
                         }
                         _ => None,
