@@ -716,35 +716,76 @@ pub fn save_screenshot_with_ppp(image: &egui::ColorImage, path: Option<&str>, cr
     }
 }
 
-/// Write the PNG and return where it went. Without a `path` it goes to a new, uniquely named file
-/// in the temp folder, created exclusively (an existing file or link there is never opened) and
-/// private to the user; a fixed name in a shared temp folder could be pre-created as a link by
-/// another local user to redirect the write. An explicit `path` is the caller's choice, but a
-/// link at that path is refused rather than followed.
-fn write_screenshot(png: &[u8], path: Option<&str>) -> std::io::Result<String> {
-    use std::io::Write;
+/// How many default screenshot files this process keeps in the temp folder; older ones are removed.
+const KEPT_DEFAULT_SCREENSHOTS: usize = 20;
+
+/// A unique name beside `dir`'s files for this process: `<prefix>-<pid>-<time>-<counter><suffix>`.
+fn unique_name(prefix: &str, suffix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    if let Some(path) = path {
-        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(std::io::Error::other(format!("{path} is a symbolic link; refusing to write through it")));
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("{prefix}-{}-{nanos:x}-{}{suffix}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Create `path` exclusively (an existing file or link there is never opened), private to the user.
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+/// Write `png` to the file just created at `path`; a failed write removes the partial file.
+fn fill_or_remove(path: &std::path::Path, out: &mut impl std::io::Write, png: &[u8]) -> std::io::Result<()> {
+    let written = out.write_all(png).and_then(|()| out.flush());
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+/// Record a new default screenshot and remove the oldest ones beyond `keep`.
+fn retain_recent(recent: &mut std::collections::VecDeque<std::path::PathBuf>, new: std::path::PathBuf, keep: usize) {
+    recent.push_back(new);
+    while recent.len() > keep {
+        if let Some(old) = recent.pop_front() {
+            let _ = std::fs::remove_file(old);
         }
-        std::fs::write(path, png)?;
+    }
+}
+
+/// Write the PNG and return where it went. Without a `path` it goes to a new, uniquely named file
+/// in the temp folder, created exclusively and private to the user; a fixed name in a shared temp
+/// folder could be pre-created as a link by another local user to redirect the write. The last
+/// [`KEPT_DEFAULT_SCREENSHOTS`] stay, older ones from this process are removed. An explicit `path`
+/// is the caller's choice: it is written to a new sibling file and renamed into place, so the write
+/// never goes through a link at `path` (a link there is replaced by the rename, not followed).
+fn write_screenshot(png: &[u8], path: Option<&str>) -> std::io::Result<String> {
+    use std::sync::Mutex;
+    static RECENT: Mutex<std::collections::VecDeque<std::path::PathBuf>> = Mutex::new(std::collections::VecDeque::new());
+    if let Some(path) = path {
+        let target = std::path::Path::new(path);
+        let name = target.file_name().ok_or_else(|| std::io::Error::other(format!("{path} is not a file path")))?.to_string_lossy();
+        let temp = target.with_file_name(unique_name(&format!(".{name}"), ".tmp"));
+        let mut file = create_private(&temp)?;
+        fill_or_remove(&temp, &mut file, png)?;
+        drop(file);
+        if let Err(e) = std::fs::rename(&temp, target) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
         return Ok(path.to_string());
     }
     let dir = filmcraft_engine::temp_dir();
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     for _ in 0..100 {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = dir.join(format!("filmcraft-screenshot-{}-{nanos:x}-{n}.png", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        match options.open(&candidate) {
+        let candidate = dir.join(unique_name("filmcraft-screenshot", ".png"));
+        match create_private(&candidate) {
             Ok(mut file) => {
-                file.write_all(png)?;
-                return Ok(candidate.to_string_lossy().into_owned());
+                fill_or_remove(&candidate, &mut file, png)?;
+                let shown = candidate.to_string_lossy().into_owned();
+                retain_recent(&mut RECENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner), candidate, KEPT_DEFAULT_SCREENSHOTS);
+                return Ok(shown);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -970,7 +1011,7 @@ mod base64_tests {
     }
 
     /// The default screenshot file is new and private each time, and an explicit path that is a link
-    /// is not written through (#2808).
+    /// is never written through (#2808).
     #[cfg(unix)]
     #[test]
     fn screenshot_files_are_exclusive_and_do_not_follow_links() {
@@ -982,18 +1023,56 @@ mod base64_tests {
         assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = (std::fs::remove_file(&a), std::fs::remove_file(&b));
 
-        let dir = std::env::temp_dir().join(format!("fc-shot-link-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, b"keep").unwrap();
         let link = dir.join("shot.png");
         symlink(&victim, &link).unwrap();
-        assert!(super::write_screenshot(b"png", Some(&link.to_string_lossy())).is_err());
+        super::write_screenshot(b"png", Some(&link.to_string_lossy())).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep", "the link target was overwritten");
+        assert_eq!(std::fs::read(&link).unwrap(), b"png");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link was replaced, not followed");
         let plain = dir.join("plain.png");
         assert_eq!(super::write_screenshot(b"png", Some(&plain.to_string_lossy())).unwrap(), plain.to_string_lossy());
         assert_eq!(std::fs::read(&plain).unwrap(), b"png");
-        let _ = std::fs::remove_dir_all(&dir);
+        let leftovers: Vec<_> =
+            std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".tmp")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A write that fails leaves no partial file behind and keeps the write error.
+    #[test]
+    fn failed_screenshot_write_removes_the_new_file() {
+        struct Failing;
+        impl std::io::Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("partial.png");
+        let _file = super::create_private(&path).unwrap();
+        let err = super::fill_or_remove(&path, &mut Failing, b"png").unwrap_err();
+        assert_eq!(err.to_string(), "disk full");
+        assert!(!path.exists());
+    }
+
+    /// Default screenshots are bounded: the oldest beyond the cap are removed.
+    #[test]
+    fn default_screenshots_are_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut recent = std::collections::VecDeque::new();
+        let paths: Vec<_> = (0..5).map(|i| tmp.path().join(format!("{i}.png"))).collect();
+        for p in &paths {
+            std::fs::write(p, b"x").unwrap();
+            super::retain_recent(&mut recent, p.clone(), 3);
+        }
+        let alive: Vec<bool> = paths.iter().map(|p| p.exists()).collect();
+        assert_eq!(alive, [false, false, true, true, true]);
     }
 
     #[test]
