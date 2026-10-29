@@ -950,7 +950,8 @@ fn audio_sync_against_a_long_stereo_clip() {
     };
     let long = gen_clip("long_stereo.mp4", &["-t", "1500"]);
     let short = gen_clip("long_stereo_excerpt.mp4", &["-ss", "100", "-t", "20"]);
-    let (Some(long), Some(short)) = (long, short) else { return };
+    // ffmpeg is there (the skip above): a fixture that cannot be generated is a failure, not a pass
+    let (Some(long), Some(short)) = (long, short) else { panic!("ffmpeg could not generate the long stereo fixtures") };
     let mut s = Session::default();
     let items = import(&mut s, &[&long, &short]);
     let clips: Vec<_> = items.iter().map(|i| crate::sync::project_clip(&s.project, *i).unwrap()).collect();
