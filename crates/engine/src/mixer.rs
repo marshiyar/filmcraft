@@ -306,6 +306,19 @@ pub fn touch(s: &mut Session, strip: TrackId, lane: &str, v: f64, t: Tick) -> Re
     Ok(json!({"recording": true, "value": v}))
 }
 
+/// Whether the lane is automated and its strip reads that automation at `t`, so a fader move
+/// that is not being recorded returns to the automation.
+fn reads_automation(s: &Session, strip: TrackId, lane: &str, t: Tick) -> bool {
+    let Some(seq) = s.mixrec.seq.or(s.state.active_sequence).and_then(|id| s.project.sequence(id)) else { return false };
+    if is_clip_lane(lane) {
+        let (eff, par) = clip_target(lane);
+        let animated =
+            seq.mix_track(strip).and_then(|tr| tr.item_at(t)).and_then(|c| c.effect(eff).and_then(|e| e.param(par)).map(Param::is_animated)).unwrap_or(false);
+        return animated && clip_mode(s, strip).reads();
+    }
+    seq.strip(strip).is_some_and(|tr| tr.lane(lane).is_some_and(Param::is_animated) && tr.mixer.mode.reads())
+}
+
 /// A control let go at `t`.
 pub fn release(s: &mut Session, strip: TrackId, lane: &str, t: Tick) -> Result<Value> {
     let automatch = Tick::from_seconds_f64(s.prefs.audio.automatch_time);
@@ -320,10 +333,16 @@ pub fn release(s: &mut Session, strip: TrackId, lane: &str, t: Tick) -> Result<V
             // Latch / Write keep holding the last value until playback stops.
             return Ok(json!({"recording": true}));
         }
-        s.previews.live.clear(strip, lane);
-        return Ok(json!({"recording": false}));
+        // Read / Off during playback: nothing is recorded. Where the lane has no automation to read
+        // the fader is a plain control, so the new level is kept (#2857, as in Premiere Pro, where a
+        // move over a track with no keyframes changes the whole track); an automated lane in Read
+        // returns to its automation.
+        if reads_automation(s, strip, lane, t) {
+            s.previews.live.clear(strip, lane);
+            return Ok(json!({"recording": false}));
+        }
     }
-    // no pass: commit the held value once
+    // no pass (or no automation to return to): commit the held value once
     let held = s.previews.live.get(strip, lane);
     s.previews.live.clear(strip, lane);
     match held {

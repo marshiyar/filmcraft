@@ -249,13 +249,61 @@ fn read_mode_does_not_record_and_commits_once_without_a_pass() {
     let r = s.execute("mixer.recordStop", json!({"time": sec(3.0)})).unwrap();
     assert_eq!(r["lanes"], 0);
     assert!(a1(&s).lane_keyframes(LANE_VOLUME).is_empty());
+    // with no automation to read, the level set during the pass is kept (#2857; see
+    // fader_moves_during_playback_in_read_mode)
+    assert_eq!(a1(&s).volume_db, -9.0);
     // stopped: a drag is heard live, then committed as one undo step
     let undo0 = s.history.undo.len();
     gesture(&mut s, "A1", &[(0.0, -2.0), (0.0, -4.0), (0.0, -5.0)]);
-    assert_eq!(a1(&s).volume_db, 0.0);
+    assert_eq!(a1(&s).volume_db, -9.0);
     s.execute("mixer.release", json!({"strip": "A1"})).unwrap();
     assert_eq!(a1(&s).volume_db, -5.0);
     assert_eq!(s.history.undo.len(), undo0 + 1);
+}
+
+/// While playing in Read mode a fader move over a lane with no automation is kept (#2857), as in
+/// Premiere Pro; over an automated lane it returns to the automation when let go.
+#[test]
+fn fader_moves_during_playback_in_read_mode() {
+    let mut s = demo();
+    s.execute("mixer.recordStart", json!({"time": 0})).unwrap();
+    let undo0 = s.history.undo.len();
+    gesture(&mut s, "A1", &[(1.0, -6.0), (1.1, -9.0)]);
+    assert_eq!(s.previews.live.get(a1(&s).id, LANE_VOLUME).map(|o| o.value), Some(-9.0), "heard while held");
+    s.execute("mixer.release", json!({"strip": "A1", "time": sec(1.2)})).unwrap();
+    assert_eq!(a1(&s).volume_db, -9.0, "no automation to return to: the level stays");
+    assert!(s.previews.live.get(a1(&s).id, LANE_VOLUME).is_none());
+    assert_eq!(s.history.undo.len(), undo0 + 1);
+    // a second move during the same pass, and the pass ends without writing automation
+    gesture(&mut s, "A1", &[(2.0, -3.0)]);
+    s.execute("mixer.release", json!({"strip": "A1", "time": sec(2.0)})).unwrap();
+    assert_eq!(a1(&s).volume_db, -3.0);
+    let r = s.execute("mixer.recordStop", json!({"time": sec(3.0)})).unwrap();
+    assert_eq!(r["lanes"], 0);
+    assert!(a1(&s).lane_keyframes(LANE_VOLUME).is_empty());
+
+    // Off ignores automation: the fader is a plain control too
+    let mut s = demo();
+    s.execute("mixer.setKeyframe", json!({"strip": "A1", "time": sec(1.0), "value": -10.0})).unwrap();
+    s.execute("mixer.setKeyframe", json!({"strip": "A1", "time": sec(2.0), "value": 0.0})).unwrap();
+    set_mode(&mut s, "A1", "Off");
+    s.execute("mixer.recordStart", json!({"time": 0})).unwrap();
+    gesture(&mut s, "A1", &[(1.0, -20.0)]);
+    s.execute("mixer.release", json!({"strip": "A1", "time": sec(1.0)})).unwrap();
+    assert_eq!(a1(&s).volume_db, -20.0);
+    assert_eq!(a1(&s).lane_keyframes(LANE_VOLUME).len(), 2, "no keyframe added");
+
+    // Read over an automated lane: the move is not recorded and the control returns to the automation
+    let mut s = demo();
+    s.execute("mixer.setKeyframe", json!({"strip": "A1", "time": sec(1.0), "value": -10.0})).unwrap();
+    s.execute("mixer.setKeyframe", json!({"strip": "A1", "time": sec(2.0), "value": 0.0})).unwrap();
+    let before = s.project.clone();
+    s.execute("mixer.recordStart", json!({"time": 0})).unwrap();
+    gesture(&mut s, "A1", &[(1.0, -20.0)]);
+    s.execute("mixer.release", json!({"strip": "A1", "time": sec(1.0)})).unwrap();
+    assert!(s.previews.live.get(a1(&s).id, LANE_VOLUME).is_none());
+    s.execute("mixer.recordStop", json!({"time": sec(3.0)})).unwrap();
+    assert_eq!(*s.project, *before, "automation untouched");
 }
 
 #[test]
