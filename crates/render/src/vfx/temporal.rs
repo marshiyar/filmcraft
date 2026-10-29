@@ -250,6 +250,18 @@ const ANALYSIS_CHUNK: usize = 16;
 /// renders asking for the same clip's path (playback workers) must not each run it.
 static ANALYSING: Mutex<()> = Mutex::new(());
 
+/// The pool the analysis runs on, apart from the one that renders frames (None: it can't be built).
+fn analysis_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().thread_name(|i| format!("stabilizer-{i}")).build().ok()).as_ref()
+}
+
+/// The step between two prepared frames of sizes `a` and `b`: `track` when they match in both
+/// dimensions (image sequences can mix sizes), else identity.
+pub(crate) fn steps_between_same_size(a: &(usize, usize), b: &(usize, usize), track: impl FnOnce(&(usize, usize), &(usize, usize)) -> Affine) -> Affine {
+    if a == b { track(a, b) } else { Affine::IDENTITY }
+}
+
 /// The frame-to-frame steps of `n` frames: `fetch(k)` prepares frame `k` (None: unavailable) and
 /// `step(a, b)` tracks from one prepared frame to the next. Frames are prepared `chunk` at a time
 /// and dropped once their steps are known, the last of a chunk is kept for the next one. Returns
@@ -333,9 +345,20 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
         let m = 8.0;
         let (w, h) = (a.base().w as f64, a.base().h as f64);
         let region = [Vec2::new(m, m), Vec2::new(w - m, m), Vec2::new(w - m, h - m), Vec2::new(m, h - m)];
-        if a.base().w == b.base().w { track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY) } else { Affine::IDENTITY }
+        steps_between_same_size(&(a.base().w, a.base().h), &(b.base().w, b.base().h), |_, _| {
+            track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY)
+        })
     };
-    let steps = chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track)?;
+    // Run on the analysis' own pool, entered from a plain thread: a worker of the pool that renders
+    // frames would steal another frame while it waits (also when it waits on a foreign pool), and
+    // that frame would wait for `ANALYSING` under the worker that holds it (a deadlock).
+    let pool = analysis_pool()?;
+    let steps = std::thread::scope(|s| {
+        let job = std::thread::Builder::new()
+            .name("stabilizer-analysis".into())
+            .spawn_scoped(s, || pool.install(|| chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track)));
+        job.ok()?.join().ok()?
+    })?;
     let (w, h) = dims.get().copied()?;
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {

@@ -1250,3 +1250,40 @@ fn stabilizer_analysis_stops_when_cancelled_and_skips_missing_frames() {
         super::temporal::chunked_steps(5, 2, &|| false, &|k| (k != 2).then_some(k), &|_: &usize, _: &usize| Affine::translate(1.0, 0.0)).expect("steps");
     assert_eq!(steps.iter().map(|s| s.e).collect::<Vec<_>>(), vec![1.0, 0.0, 0.0, 1.0]);
 }
+
+#[test]
+fn stabilizer_analysis_does_not_deadlock_inside_a_frame_parallel_render() {
+    // export renders frames with rayon; a frame that needs an analysis must not block the pool
+    // (the worker holding the analysis lock stole another frame that waited for the same lock)
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok(outer) = rayon::ThreadPoolBuilder::new().num_threads(4).build() else {
+            let _ = tx.send(false);
+            return;
+        };
+        let ok = outer.install(|| {
+            (0..12u64)
+                .into_par_iter()
+                .map(|i| {
+                    let env = ClipEnv { w: 96, h: 72, fps: 24.0, secs: 1.0, now: 0.0, key: 0xDEAD_0000 + i, seq: (96, 72), pic: shaky };
+                    stabilizer_path(&env, 0.0, filmcraft_project::TrackMethod::Position, false).is_some()
+                })
+                .collect::<Vec<_>>()
+        });
+        let _ = tx.send(ok.iter().all(|&b| b));
+    });
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(60)), Ok(true), "the analyses did not finish (deadlock)");
+}
+
+#[test]
+fn stabilizer_analysis_ignores_frames_of_another_size() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let tracked = AtomicUsize::new(0);
+    let a = super::temporal::steps_between_same_size(&(8usize, 8usize), &(8usize, 6usize), |_, _| {
+        tracked.fetch_add(1, SeqCst);
+        Affine::translate(1.0, 0.0)
+    });
+    assert_eq!((a.e, tracked.load(SeqCst)), (0.0, 0), "same width, different height: identity, nothing tracked");
+    let b = super::temporal::steps_between_same_size(&(8usize, 8usize), &(8usize, 8usize), |_, _| Affine::translate(1.0, 0.0));
+    assert_eq!(b.e, 1.0);
+}
