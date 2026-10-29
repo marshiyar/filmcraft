@@ -130,9 +130,24 @@ fn select_clip_at_playhead(s: &mut Session) -> Result<Value> {
     let tg = s.targeting().targeted;
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let ids: Vec<ClipId> = seq.all_tracks().filter(|tr| tg.contains(&tr.id)).filter_map(|tr| tr.item_at(t).map(|i| i.id)).collect();
+    // No clip under the playhead on the targeted tracks: select the gap there instead (first
+    // targeted, unlocked track that has one), as Premiere Pro does, so Clear / Ripple Delete
+    // closes it right after (#3304).
+    let gap = if ids.is_empty() {
+        seq.all_tracks()
+            .filter(|tr| tg.contains(&tr.id) && !tr.locked)
+            .find_map(|tr| edit::through::track_gaps(tr).into_iter().find(|g| g.contains(t)).map(|range| crate::GapSelection { track: tr.id, range }))
+    } else {
+        None
+    };
+    s.state.gap_selection = gap;
     s.state.selection = with_links(s, &ids);
     s.state.edit_points.clear();
     s.state.caption_selection.clear();
+    if s.state.gap_selection.is_some() {
+        s.state.transition_selection.clear();
+        s.state.trim_shift = Default::default();
+    }
     Ok(json!({"selection": s.state.selection.iter().map(|c| c.0).collect::<Vec<_>>()}))
 }
 
