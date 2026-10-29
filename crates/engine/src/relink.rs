@@ -543,17 +543,16 @@ pub fn search(s: &Session, p: &Value) -> Result<Value> {
 
 /// Whether Make Offline ▸ delete may remove `path` for item `id`: a regular file (not a link or
 /// a folder) with a media extension, whose size and fingerprint equal the ones recorded when the
-/// item was imported or linked. An item with no recorded identity (older projects) is held to
-/// the first two checks only.
+/// item was imported or linked. An item with no recorded identity (a New Offline File placeholder,
+/// or a project from an older build) has no evidence it was ever linked to this file, so it goes
+/// offline and its file is left alone; relinking it records an identity.
 fn deletable_media(s: &Session, id: ItemId, path: &str) -> bool {
     let p = Path::new(path);
     if !filmcraft_media::is_importable(p) || !std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()) {
         return false;
     }
-    match s.project.item(id).and_then(|i| i.as_media()).and_then(|m| m.identity) {
-        Some(want) => identity_of(&*s.services, path).is_ok_and(|have| have == want),
-        None => true,
-    }
+    let recorded = s.project.item(id).and_then(|i| i.as_media()).and_then(|m| m.identity);
+    recorded.is_some_and(|want| identity_of(&*s.services, path).is_ok_and(|have| have == want))
 }
 
 /// `media.makeOffline {items?, deleteFiles?}`.

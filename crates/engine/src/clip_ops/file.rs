@@ -147,7 +147,7 @@ pub(super) fn offline_file(s: &mut Session, p: &Value) -> Result<Value> {
     };
     // A name, never a path: the item's media path is what Make Offline ▸ delete would remove.
     let file_name = str_p(p, "fileName")
-        .and_then(|n| n.rsplit(['/', '\\']).next())
+        .and_then(|n| n.rsplit(['/', '\\', ':']).next())
         .filter(|n| !n.is_empty() && *n != "." && *n != "..")
         .map(str::to_string)
         .unwrap_or_else(|| "Offline.mov".into());

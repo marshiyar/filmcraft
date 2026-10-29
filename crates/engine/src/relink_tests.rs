@@ -419,7 +419,15 @@ fn make_offline_delete_only_removes_the_media_the_item_was_linked_to() {
         assert_eq!(r["deleted"], json!([]), "{victim:?}");
         assert!(victim.exists(), "{victim:?} was deleted");
     }
+    // an item with no recorded identity (a placeholder, an older project) never deletes anything
+    set_media_path(&mut s, items[0], &a.to_string_lossy());
+    std::sync::Arc::make_mut(&mut s.project).item_mut(items[0]).and_then(|i| i.as_media_mut()).unwrap().identity = None;
+    let r = s.execute("media.makeOffline", json!({"items": [items[0].0], "deleteFiles": true})).unwrap();
+    assert_eq!(r["deleted"], json!([]), "{r}");
+    assert!(a.exists(), "a file with no recorded identity was deleted");
     // the file the item was imported from is deleted
+    let id_a = crate::relink::identity_of(&*s.services, &a.to_string_lossy()).unwrap();
+    std::sync::Arc::make_mut(&mut s.project).item_mut(items[0]).and_then(|i| i.as_media_mut()).unwrap().identity = Some(id_a);
     set_media_path(&mut s, items[0], &a.to_string_lossy());
     let r = s.execute("media.makeOffline", json!({"items": [items[0].0], "deleteFiles": true})).unwrap();
     assert_eq!(r["deleted"].as_array().map(Vec::len), Some(1), "{r}");
@@ -430,7 +438,15 @@ fn make_offline_delete_only_removes_the_media_the_item_was_linked_to() {
 #[test]
 fn new_offline_file_keeps_only_the_file_name() {
     let mut s = Session::default();
-    for (given, want) in [("/etc/passwd", "passwd"), ("..\\..\\x\\y.mov", "y.mov"), ("clip.mov", "clip.mov"), ("/", "Offline.mov"), ("..", "Offline.mov")] {
+    for (given, want) in [
+        ("/etc/passwd", "passwd"),
+        ("..\\..\\x\\y.mov", "y.mov"),
+        ("clip.mov", "clip.mov"),
+        ("C:target.mov", "target.mov"),
+        ("C:", "Offline.mov"),
+        ("/", "Offline.mov"),
+        ("..", "Offline.mov"),
+    ] {
         let r = s.execute("file.newOfflineFile", json!({"fileName": given})).unwrap();
         let id = ItemId(r["item"].as_u64().unwrap());
         let m = s.project.item(id).unwrap().as_media().unwrap();
