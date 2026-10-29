@@ -719,7 +719,9 @@ pub fn clamp_trim(seq: &Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delt
             let handle = match (it.reverse, media) {
                 (true, Some(m)) => (m - it.source_out()).max(Tick::ZERO),
                 (true, None) => Tick::MAX,
-                (false, _) => head(ctx, it),
+                // media with no length (a still, a graphic, an adjustment layer) has no head limit, like its tail (#3367)
+                (false, None) => Tick::MAX,
+                (false, Some(_)) => head(ctx, it),
             };
             let max_ext = if handle == Tick::MAX { Tick::MAX } else { Tick((handle.0 as f64 / speed).floor() as i64) };
             let lo = if mode == TrimMode::Regular { (-(it.start - prev_end)).max(-max_ext) } else { -max_ext };
@@ -789,6 +791,10 @@ pub fn trim(seq: &mut Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delta:
     {
         let (_, it) = work.find_item_mut(clip).ok_or(EditError::NoItem(clip))?;
         move_edge(it, edge, d, mode == TrimMode::Regular);
+        // media with no length (graphics, stills) extends left without a head: keep source_in from going below 0
+        if edge == Edge::In && !it.reverse && it.frame_hold.is_none() && media_len(ctx, it).is_none() {
+            it.source_in = it.source_in.max(Tick::ZERO);
+        }
     }
     if mode == TrimMode::Ripple {
         let (at, shift) = match edge {
