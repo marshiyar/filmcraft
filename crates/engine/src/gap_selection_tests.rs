@@ -342,6 +342,22 @@ fn select_clip_at_playhead_selects_the_gap_under_the_playhead() {
     assert!(s.state.gap_selection.is_none() && s.state.selection.is_empty());
 }
 
+/// Select Next / Previous Clip are clip navigation: over a gap they leave nothing selected rather
+/// than selecting the gap (which Clear would then close).
+#[test]
+fn select_next_and_previous_clip_do_not_select_a_gap() {
+    let mut s = Session::default();
+    two_clips(&mut s, [0, 96]);
+    let rate = s.sequence_rate();
+    let v1 = s.active_sequence().unwrap().video_tracks[0].id;
+    s.execute("timeline.setTargeting", json!({"track": v1.0, "targeted": true})).unwrap();
+    s.set_playhead(rate.tick_of(60));
+    for id in ["timeline.selectNextClip", "timeline.selectPrevClip"] {
+        s.execute(id, json!({})).unwrap();
+        assert!(s.state.gap_selection.is_none() && s.state.selection.is_empty(), "{id}");
+    }
+}
+
 #[test]
 fn select_clip_at_playhead_skips_a_gap_on_a_locked_track() {
     let mut s = Session::default();
