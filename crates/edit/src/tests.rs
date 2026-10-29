@@ -289,6 +289,35 @@ fn regular_trim_respects_neighbours_and_handles() {
     fx.seq.check().unwrap();
 }
 
+/// A graphic (media with no length) has no head handle, so its In edge extends left like its Out edge
+/// extends right, up to the previous clip (#3367).
+#[test]
+fn a_graphic_extends_from_its_left_edge() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    let g = fx.put(v1, 20, 10, 0);
+    fx.put(v1, 0, 8, 0);
+    fn ctx(n: &mut u64) -> EditCtx<'_> {
+        EditCtx { next_id: n, media_duration: &|_| None, media_start: &|_| Tick::ZERO, min_duration: f(1) }
+    }
+    let mut n = fx.next;
+    // 12 frames of room before the previous clip
+    let d = trim(&mut fx.seq, g, Edge::In, TrimMode::Regular, -f(30), &mut ctx(&mut n)).unwrap();
+    assert_eq!(d, -f(12));
+    let it = fx.seq.find_item(g).unwrap().1;
+    assert_eq!((it.start, it.duration, it.source_in), (f(8), f(22), Tick::ZERO));
+    // shortening and extending again round-trips
+    trim(&mut fx.seq, g, Edge::In, TrimMode::Regular, f(5), &mut ctx(&mut n)).unwrap();
+    trim(&mut fx.seq, g, Edge::In, TrimMode::Regular, -f(5), &mut ctx(&mut n)).unwrap();
+    let it = fx.seq.find_item(g).unwrap().1;
+    assert_eq!((it.start, it.duration, it.source_in), (f(8), f(22), Tick::ZERO));
+    // a clip with real media and no head is still limited
+    let a = fx.put(fx.v(1), 20, 10, 0);
+    let d = trim(&mut fx.seq, a, Edge::In, TrimMode::Regular, -f(3), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(d, Tick::ZERO);
+    fx.seq.check().unwrap();
+}
+
 #[test]
 fn trim_on_a_locked_track_is_refused() {
     let mut fx = Fx::new();
