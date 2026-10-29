@@ -750,10 +750,15 @@ fn param_value_widget(
             }
             let fams = filmcraft_text::families();
             let salt = ("ec-font", clip.0, idx, pd.id);
+            // the value column can be narrower than the usual drop-down; keep the button inside it
+            let w = 150.0_f32.min(vui.available_width()).max(40.0);
+            let prefix = format!("effectControls.text.{}.{}.option", idx, pd.id);
             let combo = if pd.id == "font" {
-                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(150.0).height(400.0).show_ui(vui, |ui| {
+                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(w).height(400.0).show_ui(vui, |ui| {
                     for (f, _) in &fams {
-                        if ui.selectable_label(f == current, f).clicked() {
+                        let r = ui.selectable_label(f == current, f);
+                        app.auto.add(&format!("{prefix}.{f}"), r.rect, f);
+                        if r.clicked() {
                             set = Some(json!(f));
                         }
                     }
@@ -770,9 +775,11 @@ fn param_value_widget(
                         styles.push(extra);
                     }
                 }
-                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(150.0).show_ui(vui, |ui| {
+                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(w).show_ui(vui, |ui| {
                     for st in styles {
-                        if ui.selectable_label(st == current, st).clicked() {
+                        let r = ui.selectable_label(st == current, st);
+                        app.auto.add(&format!("{prefix}.{st}"), r.rect, st);
+                        if r.clicked() {
                             set = Some(json!(st));
                         }
                     }

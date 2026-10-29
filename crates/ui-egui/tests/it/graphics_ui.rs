@@ -524,8 +524,14 @@ fn effect_controls_font_and_style_are_drop_downs_that_apply() {
         d.ok("ui.scroll", json!({"x": 150.0, "y": 300.0, "dy": -120.0}));
         d.frames(2);
     }
+    let r = d.rect(&font);
+    assert!(r[2] <= 150.0 + 0.5, "the drop-down never asks for more than the value column holds: {r:?}");
     d.ok("ui.click", json!({"id": font}));
     d.frames(3);
+    // every visible option is addressable by id (review of #3588)
+    let opts = d.ok("ui.elements", json!({"prefix": format!("{font}.option.")}));
+    let want = format!("{font}.option.{fam}");
+    assert!(opts.as_array().unwrap().iter().any(|e| e["id"].as_str() == Some(want.as_str())), "no {want}");
     pick(&mut d, &fam);
     assert_eq!(text_param(&mut d, clip, "font"), Some(filmcraft_project::ParamValue::Text(fam.clone())), "picking a family applies it");
     // the style list follows the family
