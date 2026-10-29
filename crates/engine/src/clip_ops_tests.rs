@@ -1161,3 +1161,24 @@ fn applied_transform_centres_its_points_in_the_clip_picture() {
         assert_eq!(m.param("position").unwrap().value.as_vec2().unwrap(), frame_centre);
     }
 }
+
+/// #3230: on a frame hold, keyframes are placed at the media time the effects are evaluated at
+/// (`effect_time_at`), not at the frozen picture's time, so two playhead positions give two keys.
+#[test]
+fn keyframes_on_a_frame_hold_land_at_distinct_times() {
+    let mut s = demo();
+    let rate = s.sequence_rate();
+    let c = v1(&s)[1].clone();
+    select(&mut s, &[c.id.0]);
+    s.execute("clip.frameHoldOptions", json!({"holdOn": "in"})).unwrap();
+    let held = clip(&s, c.id.0);
+    assert!(held.frame_hold.is_some() && !held.hold_filters);
+    for f in [2, 10] {
+        s.execute("playhead.set", json!({"time": (c.start + rate.tick_of(f)).0})).unwrap();
+        s.execute("effects.addKeyframe", json!({"clip": c.id.0, "effect": "motion", "param": "scale"})).unwrap();
+    }
+    let it = clip(&s, c.id.0);
+    let times: Vec<Tick> = it.effect("motion").unwrap().param("scale").unwrap().keyframes.iter().map(|k| k.time).collect();
+    assert_eq!(times.len(), 2, "both keyframes survive: {times:?}");
+    assert_eq!(times, vec![it.effect_time_at(c.start + rate.tick_of(2)), it.effect_time_at(c.start + rate.tick_of(10))]);
+}

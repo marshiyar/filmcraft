@@ -1218,3 +1218,26 @@ fn negative_place_and_marker_times_are_refused() {
     s.execute("markers.add", json!({"frame": 0, "name": "start"})).unwrap();
     assert!(s.active_sequence().unwrap().markers.iter().any(|m| m.start == Tick::ZERO && m.name == "start"));
 }
+
+/// #3351: closing the last sequence leaves an empty Timeline; a toast says the work is not lost.
+#[test]
+fn closing_the_last_sequence_says_nothing_was_deleted() {
+    let mut s = demo();
+    let main = s.state.active_sequence.unwrap();
+    let b = ItemId(s.execute("file.newSequence", json!({"name": "B"})).unwrap()["sequence"].as_u64().unwrap());
+    s.drain_events();
+    let toasts = |s: &mut Session| -> Vec<String> {
+        s.drain_events().into_iter().filter_map(|e| if let Event::Toast { message, .. } = e { Some(message) } else { None }).collect()
+    };
+    s.execute("sequence.close", json!({"item": b.0})).unwrap();
+    assert!(toasts(&mut s).is_empty(), "another tab remains: no toast");
+    let (revision, steps) = (s.revision, s.history.undo.len());
+    s.execute("sequence.close", json!({"item": main.0})).unwrap();
+    assert_eq!(s.state.active_sequence, None);
+    let got = toasts(&mut s);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains("Nothing was deleted") && got[0].contains("Project panel"), "{}", got[0]);
+    // the sequence is still in the project and closing is not an edit
+    assert!(s.project.sequence(main).is_some());
+    assert_eq!((s.revision, s.history.undo.len()), (revision, steps));
+}
