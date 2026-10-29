@@ -140,7 +140,13 @@ pub fn open_path(app: &mut FilmcraftApp, ctx: &egui::Context, path: &str, reveal
 /// through as asked; anything else falls back to opening the folder that contains it, or errors.
 fn safe_open_target(path: &str, reveal: bool) -> Result<(String, bool), String> {
     let p = std::path::Path::new(path);
-    let local = p.is_absolute() && !path.starts_with("\\\\") && !path.starts_with("//") && !path.contains('\0');
+    // Windows reads `\\server`, `//server` and mixed `\/server` alike as network paths: accept only a
+    // plain disk prefix (or none), whatever the separators.
+    let disk_only = p.components().next().is_none_or(|c| match c {
+        std::path::Component::Prefix(prefix) => matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)),
+        _ => true,
+    });
+    let local = p.is_absolute() && disk_only && !path.contains('\0');
     if !local {
         return Err(format!("`{path}` is not an absolute local path"));
     }
@@ -1048,7 +1054,17 @@ mod open_target_tests {
 
     #[test]
     fn urls_relative_unc_and_missing_folders_are_refused() {
-        for bad in ["https://example.com/a.mp4", "file:///etc/passwd", "clip.mp4", "../clip.mp4", "//server/share/a.mp4", "\\\\server\\share\\a.mp4", ""] {
+        for bad in [
+            "https://example.com/a.mp4",
+            "file:///etc/passwd",
+            "clip.mp4",
+            "../clip.mp4",
+            "//server/share/a.mp4",
+            "\\\\server\\share\\a.mp4",
+            "\\/server/share/a.mp4",
+            "/\\server/share/a.mp4",
+            "",
+        ] {
             assert!(safe_open_target(bad, false).is_err(), "{bad}");
         }
         assert!(safe_open_target("/definitely/not/a/real/dir/clip.mp4", false).is_err());
