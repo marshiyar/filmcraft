@@ -133,6 +133,26 @@ pub fn open_path(app: &mut FilmcraftApp, ctx: &egui::Context, path: &str, reveal
     }
 }
 
+/// What Edit Original / Reveal may hand to the OS opener for a media path. Project files and the
+/// control channel can name any string, and opening one in its default application would run
+/// whatever the OS associates with it (an executable, a script, a `scheme:` handler, a network
+/// path). Only an absolute local path to an existing regular file with a media extension goes
+/// through as asked; anything else falls back to opening the folder that contains it, or errors.
+fn safe_open_target(path: &str, reveal: bool) -> Result<(String, bool), String> {
+    let p = std::path::Path::new(path);
+    let local = p.is_absolute() && !path.starts_with("\\\\") && !path.starts_with("//") && !path.contains('\0');
+    if !local {
+        return Err(format!("`{path}` is not an absolute local path"));
+    }
+    if p.is_file() && filmcraft_media::is_importable(p) {
+        return Ok((path.to_string(), reveal));
+    }
+    match p.parent().filter(|d| d.is_dir()) {
+        Some(dir) => Ok((dir.to_string_lossy().into_owned(), false)),
+        None => Err(format!("`{path}` is not a media file and its folder does not exist")),
+    }
+}
+
 /// Where Reveal Log Files points: `<data dir>/Logs` (the temp folder without a data directory).
 pub fn logs_dir(app: &FilmcraftApp) -> std::path::PathBuf {
     app.session.prefs_path.as_ref().and_then(|p| p.parent()).map(|d| d.join("Logs")).unwrap_or_else(|| filmcraft_engine::temp_dir().join("FilmCraft Logs"))
@@ -194,7 +214,8 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             let r = app.session.execute(id, params.clone()).map_err(|e| e.to_string());
             return Some(r.and_then(|v| {
                 for p in v["paths"].as_array().cloned().unwrap_or_default() {
-                    open_path(app, ctx, p.as_str().unwrap_or_default(), reveal)?;
+                    let (target, reveal) = safe_open_target(p.as_str().unwrap_or_default(), reveal)?;
+                    open_path(app, ctx, &target, reveal)?;
                 }
                 Ok(v)
             }));
@@ -983,5 +1004,53 @@ pub fn search_bin_rows(
                 filmcraft_project::Bin { id: sb.id, name: sb.name.clone(), children: matches.into_iter().map(filmcraft_project::BinEntry::Item).collect() };
             draw_items(app, ui, &bin, row, actions);
         }
+    }
+}
+
+#[cfg(test)]
+mod open_target_tests {
+    use super::safe_open_target;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fc-open-target-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn media_file_passes_through_unchanged() {
+        let dir = scratch("media");
+        let clip = dir.join("clip.mov");
+        std::fs::write(&clip, b"x").unwrap();
+        let path = clip.to_string_lossy().into_owned();
+        assert_eq!(safe_open_target(&path, false), Ok((path.clone(), false)));
+        assert_eq!(safe_open_target(&path, true), Ok((path, true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_media_file_opens_its_folder_instead() {
+        let dir = scratch("script");
+        let script = dir.join("run.command");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        let got = safe_open_target(&script.to_string_lossy(), false).unwrap();
+        assert_eq!(got, (dir.to_string_lossy().into_owned(), false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_media_file_opens_its_existing_folder() {
+        let dir = scratch("offline");
+        let gone = dir.join("gone.mp4");
+        assert_eq!(safe_open_target(&gone.to_string_lossy(), true), Ok((dir.to_string_lossy().into_owned(), false)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn urls_relative_unc_and_missing_folders_are_refused() {
+        for bad in ["https://example.com/a.mp4", "file:///etc/passwd", "clip.mp4", "../clip.mp4", "//server/share/a.mp4", "\\\\server\\share\\a.mp4", ""] {
+            assert!(safe_open_target(bad, false).is_err(), "{bad}");
+        }
+        assert!(safe_open_target("/definitely/not/a/real/dir/clip.mp4", false).is_err());
     }
 }
