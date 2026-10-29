@@ -241,10 +241,77 @@ pub fn clear_stabilizer_cache() {
     }
 }
 
+/// How many frames the analysis prepares at once. A prepared frame is the gray picture and its
+/// pyramid (about 8 MB at the detailed size), so the working set stays near 16 frames however
+/// long the clip is (#1895: every frame of a 15 s clip at once took 3 GB).
+const ANALYSIS_CHUNK: usize = 16;
+
+/// Only one clip is analysed at a time: the analysis already uses every rayon worker, and several
+/// renders asking for the same clip's path (playback workers) must not each run it.
+static ANALYSING: Mutex<()> = Mutex::new(());
+
+/// The frame-to-frame steps of `n` frames: `fetch(k)` prepares frame `k` (None: unavailable) and
+/// `step(a, b)` tracks from one prepared frame to the next. Frames are prepared `chunk` at a time
+/// and dropped once their steps are known, the last of a chunk is kept for the next one. Returns
+/// None when `cancelled` says so (checked before every chunk).
+pub(crate) fn chunked_steps<T: Send + Sync>(
+    n: usize,
+    chunk: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    fetch: &(dyn Fn(usize) -> Option<T> + Sync),
+    step: &(dyn Fn(&T, &T) -> Affine + Sync),
+) -> Option<Vec<Affine>> {
+    let chunk = chunk.max(1);
+    let mut steps = Vec::with_capacity(n.saturating_sub(1));
+    let mut carry: Option<Option<T>> = None;
+    let mut next = 0;
+    while next < n {
+        if cancelled() {
+            return None;
+        }
+        let end = (next + chunk).min(n);
+        let fresh: Vec<Option<T>> = (next..end).into_par_iter().map(|k| if cancelled() { None } else { fetch(k) }).collect();
+        let mut frames: Vec<Option<T>> = Vec::with_capacity(fresh.len() + 1);
+        frames.extend(carry.take());
+        frames.extend(fresh);
+        let pairs: Vec<Affine> = (0..frames.len().saturating_sub(1))
+            .into_par_iter()
+            .map(|k| match (frames.get(k), frames.get(k + 1)) {
+                (Some(Some(a)), Some(Some(b))) => step(a, b),
+                _ => Affine::IDENTITY,
+            })
+            .collect();
+        steps.extend(pairs);
+        carry = frames.pop();
+        next = end;
+    }
+    (!cancelled()).then_some(steps)
+}
+
 /// Analyse (or fetch the cached analysis of) the clip `env` describes.
 pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
     let key = env.clip_key() ^ (method as u64).wrapping_mul(0x9E37) ^ (detailed as u64).wrapping_mul(0x51_7CC1);
-    if let Some(p) = path_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+    let cached = || path_cache().lock().ok().and_then(|c| c.get(&key).cloned());
+    if let Some(p) = cached() {
+        return Some(p);
+    }
+    // wait for a running analysis (it may be this clip's), giving up when this request is cancelled
+    let _turn = loop {
+        match ANALYSING.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(g)) => break g.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if filmcraft_media::cancel::cancelled() {
+                    return None;
+                }
+                if let Some(p) = cached() {
+                    return Some(p);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    };
+    if let Some(p) = cached() {
         return Some(p);
     }
     let fps = env.frame_rate().max(1.0);
@@ -252,28 +319,24 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     let src_w = env.source_size().0.max(1) as f32;
     let target_w = if detailed { 960.0 } else { 480.0 };
     let scale = (target_w / src_w).min(1.0);
-    let frames: Vec<Option<Prepared>> = (0..n)
-        .into_par_iter()
-        .map(|k| {
-            if filmcraft_media::cancel::cancelled() {
-                return None;
-            }
-            env.source_frame(k as f64 / fps - now, scale).map(|f| Prepared::new(gray_of(&f)))
-        })
-        .collect();
-    if filmcraft_media::cancel::cancelled() {
-        return None;
-    }
-    let (w, h) = frames.iter().flatten().next().map(|p| (p.base().w, p.base().h))?;
-    let m = 8.0;
-    let region = [Vec2::new(m, m), Vec2::new(w as f64 - m, m), Vec2::new(w as f64 - m, h as f64 - m), Vec2::new(m, h as f64 - m)];
-    let steps: Vec<Affine> = (0..n.saturating_sub(1))
-        .into_par_iter()
-        .map(|k| match (&frames[k], &frames[k + 1]) {
-            (Some(a), Some(b)) if a.base().w == b.base().w => track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY),
-            _ => Affine::IDENTITY,
-        })
-        .collect();
+    // the pool's workers don't carry this thread's cancellation flag; hand it to them
+    let hints = filmcraft_media::cancel::Context::current();
+    let cancelled = || hints.clone().run(filmcraft_media::cancel::cancelled);
+    // every frame has the size of the first one that exists
+    let dims: OnceLock<(usize, usize)> = OnceLock::new();
+    let fetch = |k: usize| {
+        let p = env.source_frame(k as f64 / fps - now, scale).map(|f| Prepared::new(gray_of(&f)))?;
+        let _ = dims.set((p.base().w, p.base().h));
+        Some(p)
+    };
+    let track = |a: &Prepared, b: &Prepared| {
+        let m = 8.0;
+        let (w, h) = (a.base().w as f64, a.base().h as f64);
+        let region = [Vec2::new(m, m), Vec2::new(w - m, m), Vec2::new(w - m, h - m), Vec2::new(m, h - m)];
+        if a.base().w == b.base().w { track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY) } else { Affine::IDENTITY }
+    };
+    let steps = chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track)?;
+    let (w, h) = dims.get().copied()?;
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {
         if c.len() > 64 {

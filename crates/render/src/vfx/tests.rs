@@ -1191,3 +1191,62 @@ fn transform_shutter_uses_the_sequence_frame_rate_without_env() {
         assert!(delta(frame) > 1e-3, "frame {frame} moves but is sharp");
     }
 }
+
+/// A frame that counts how many are alive at once.
+struct Live<'a> {
+    k: usize,
+    live: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> Live<'a> {
+    fn new(k: usize, live: &'a std::sync::atomic::AtomicUsize, peak: &std::sync::atomic::AtomicUsize) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        peak.fetch_max(live.fetch_add(1, SeqCst) + 1, SeqCst);
+        Live { k, live }
+    }
+}
+
+impl Drop for Live<'_> {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn stabilizer_analysis_keeps_only_a_chunk_of_frames_in_memory() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let (live, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    // a long clip (#1895: every frame was prepared before any was tracked)
+    let n = 400;
+    let steps = super::temporal::chunked_steps(n, 8, &|| false, &|k| Some(Live::new(k, &live, &peak)), &|a: &Live, b: &Live| {
+        Affine::translate((b.k - a.k) as f64, a.k as f64)
+    })
+    .expect("not cancelled");
+    assert_eq!(steps.len(), n - 1);
+    // every pair is tracked once, in order, also across chunk boundaries
+    assert!(steps.iter().enumerate().all(|(k, s)| s.e == 1.0 && s.f == k as f64), "steps out of order");
+    assert!(peak.load(SeqCst) <= 9, "{} frames alive at once", peak.load(SeqCst));
+    assert_eq!(live.load(SeqCst), 0, "frames are released");
+}
+
+#[test]
+fn stabilizer_analysis_stops_when_cancelled_and_skips_missing_frames() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let fetched = AtomicUsize::new(0);
+    let r = super::temporal::chunked_steps(
+        1000,
+        8,
+        &|| fetched.load(SeqCst) >= 20,
+        &|k| {
+            fetched.fetch_add(1, SeqCst);
+            Some(k)
+        },
+        &|_: &usize, _: &usize| Affine::IDENTITY,
+    );
+    assert!(r.is_none(), "a cancelled analysis gives no path");
+    assert!(fetched.load(SeqCst) < 100, "it stopped early: {} frames", fetched.load(SeqCst));
+    // a frame that can't be decoded leaves identity steps around it
+    let steps =
+        super::temporal::chunked_steps(5, 2, &|| false, &|k| (k != 2).then_some(k), &|_: &usize, _: &usize| Affine::translate(1.0, 0.0)).expect("steps");
+    assert_eq!(steps.iter().map(|s| s.e).collect::<Vec<_>>(), vec![1.0, 0.0, 0.0, 1.0]);
+}
