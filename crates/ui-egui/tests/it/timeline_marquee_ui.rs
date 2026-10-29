@@ -184,3 +184,30 @@ fn escape_cancels_the_box_and_restores_the_selection() {
     d.frames(2);
     assert!(d.selected(a) && !d.selected(b), "Escape put back the selection the drag began with");
 }
+
+#[test]
+fn scrolling_mid_drag_keeps_the_box_anchored_to_the_content() {
+    let mut d = Driver::demo();
+    // scrolled right a little, so the view can move back while the box is open
+    d.ok("ui.set", json!({"timeline": {"scroll": 10.0}}));
+    d.frames(40);
+    let (_, b, _, rb, start) = d.setup();
+    d.exec("timeline.select", json!({"clips": []}));
+    d.send(egui::Event::PointerMoved(start));
+    d.button(start, true);
+    let over_b = egui::pos2(rb.center().x, start.y + 2.0);
+    d.move_to(start, over_b);
+    assert!(d.selected(b), "the box reaches the last clip before the view scrolls");
+    // scroll the content right by more than the clip is wide, the pointer held still: the clip ends
+    // up past where the box began on screen, but the box's corner moved with the content
+    let shift_px = rb.width() + 40.0;
+    let pps = d.harness.state().ui.timeline.pps as f32;
+    d.ok("ui.set", json!({"timeline": {"scroll": 10.0 - (shift_px / pps) as f64}}));
+    d.frames(60);
+    let rb_now = d.rect(&format!("timeline.clip.{b}"));
+    assert!(rb_now.min.x > start.x + 10.0, "the clip really moved past the screen position the drag began at");
+    assert!(d.selected(b), "scrolling does not drop the clip from the box");
+    d.button(over_b, false);
+    d.frames(2);
+    assert!(d.selected(b), "the release keeps what the box showed");
+}
