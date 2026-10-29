@@ -684,6 +684,45 @@ fn snap_in_program_monitor_and_graphics_menu() {
 }
 
 #[test]
+fn snap_in_program_monitor_snaps_video_clip_motion_drags() {
+    let mut d = Driver::demo();
+    let seq = d.exec("sequence.inspect", json!({}));
+    let c = &seq["video"][0]["items"][0];
+    let (clip, start, dur) = (c["clip"].as_u64().unwrap(), c["start"].as_i64().unwrap(), c["duration"].as_i64().unwrap());
+    d.exec("playhead.set", json!({"time": start + dur / 2}));
+    d.exec("timeline.select", json!({"clips": [clip]}));
+    // half size, centred 80 frame pixels left of the frame centre
+    d.exec("effects.setParam", json!({"clip": clip, "effect": "motion", "param": "scale", "value": 50.0}));
+    d.exec("effects.setParam", json!({"clip": clip, "effect": "motion", "param": "position", "value": [880.0, 540.0]}));
+    d.frames(3);
+    d.exec("effects.select", json!({"clip": clip, "effect": "motion"}));
+    d.frames(3);
+    let pos_x = |d: &mut Driver| {
+        let app = d.harness.state();
+        let it = app.session.active_sequence().unwrap().find_item(filmcraft_project::ClipId(clip)).unwrap().1;
+        let mt = it.source_time_at(app.session.playhead());
+        it.effect("motion").unwrap().param("position").unwrap().vec2_at(mt).x
+    };
+    let drag = |d: &mut Driver, frame_dx: f64, extra: f64| {
+        let pic = d.rect("program.picture");
+        let k = pic[2] / 1920.0;
+        let b = d.rect("program.transform.box");
+        // off the anchor point at the centre
+        let (x, y) = (b[0] + b[2] * 0.3, b[1] + b[3] * 0.3);
+        d.ok("ui.drag", json!({"from": {"x": x, "y": y}, "to": {"x": x + frame_dx * k + extra, "y": y}, "steps": 8}));
+        d.frames(2);
+    };
+    // the box centre goes 80 frame pixels + 3 screen pixels towards the frame centre: it snaps onto it
+    drag(&mut d, 80.0, 3.0);
+    assert!((pos_x(&mut d) - 960.0).abs() < 0.01, "snapped to the frame centre: {}", pos_x(&mut d));
+    // snapping off: the same kind of drag lands off the centre
+    d.menu("view.snapInProgramMonitor");
+    assert_eq!(d.program()["snap"], false);
+    drag(&mut d, -80.0, 3.0);
+    assert!((pos_x(&mut d) - 880.0).abs() > 0.5, "free move: {}", pos_x(&mut d));
+}
+
+#[test]
 fn elements_wait_for_the_timeline_zoom_to_settle() {
     let mut d = Driver::demo();
     let project = d.exec("project.inspect", json!({}));
