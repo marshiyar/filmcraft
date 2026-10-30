@@ -184,15 +184,13 @@ pub(crate) fn wheel_input(ctx: &egui::Context) -> WheelInput {
                         egui::MouseWheelUnit::Page => 400.0,
                     };
                     // On Windows and Linux a trackpad pinch arrives as Ctrl + wheel (#3306): a
-                    // zoom, spreading zooms in as Zoom does. Those backends cannot say where a
-                    // wheel event came from (`Unknown`), but a mouse wheel turns in whole lines
-                    // while a trackpad gives points or fractions of a line. A mouse wheel with
-                    // Ctrl held is still the sideways scroll.
+                    // zoom, spreading zooms in as Zoom does. Those backends report the source as
+                    // `Unknown`, and a high-resolution mouse wheel also turns in fractions of a
+                    // line, so only the unit tells them apart: points are a trackpad. A mouse
+                    // wheel with Ctrl held is still the sideways scroll.
                     let trackpad = match source {
                         egui::MouseWheelSource::Trackpad | egui::MouseWheelSource::Momentum => true,
-                        egui::MouseWheelSource::Unknown => {
-                            matches!(unit, egui::MouseWheelUnit::Point) || (matches!(unit, egui::MouseWheelUnit::Line) && delta.y.fract() != 0.0)
-                        }
+                        egui::MouseWheelSource::Unknown => matches!(unit, egui::MouseWheelUnit::Point),
                         _ => false,
                     };
                     // a swipe with no vertical part is not a pinch: it takes the sideways-scroll path below

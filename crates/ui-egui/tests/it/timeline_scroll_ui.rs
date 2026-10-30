@@ -399,17 +399,20 @@ fn a_trackpad_pinch_sent_as_ctrl_wheel_zooms_the_timeline() {
     let back = pinch(&mut d, -40.0, Src::Trackpad, Unit::Point);
     assert!((back - 50.0).abs() < 1e-3, "pinching zooms out by the same factor: {back}");
     assert!(pinch(&mut d, -40.0, Src::Momentum, Unit::Point) < 50.0, "the tail of a pinch too");
-    // what Windows and Linux send: the source is Unknown; a trackpad gives points or part of a line
+    // what Windows and Linux send: the source is Unknown; a trackpad gives points
     d.ok("ui.set", json!({"timeline": {"pps": 50.0}}));
     d.frames(3);
     assert!(pinch(&mut d, 40.0, Src::Unknown, Unit::Point) > 50.0, "points, source unknown");
-    d.ok("ui.set", json!({"timeline": {"pps": 50.0}}));
-    d.frames(3);
-    assert!(pinch(&mut d, -0.25, Src::Unknown, Unit::Line) < 50.0, "a fraction of a line, source unknown");
     // whole lines are a mouse wheel: no zoom, even with Ctrl held
     d.ok("ui.set", json!({"timeline": {"pps": 50.0}}));
     d.frames(3);
     assert_eq!(pinch(&mut d, -1.0, Src::Unknown, Unit::Line), 50.0, "a wheel notch does not zoom");
+    // a high-resolution mouse wheel turns in fractions of a line (source Unknown): it scrolls
+    // sideways with Ctrl held, as the whole-line wheel does
+    d.ok("ui.set", json!({"timeline": {"pps": 50.0, "scroll": 4.0}}));
+    d.frames(3);
+    assert_eq!(pinch(&mut d, -0.25, Src::Unknown, Unit::Line), 50.0, "a fractional line does not zoom");
+    assert!(d.view().0 > 4.0, "and it scrolls the Timeline sideways");
     // a mouse wheel with Ctrl held is still the sideways scroll
     d.ok("ui.set", json!({"timeline": {"pps": 50.0, "scroll": 4.0}}));
     d.frames(3);
