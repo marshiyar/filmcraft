@@ -58,6 +58,17 @@ pub enum UsageError {
     Bridge(#[source] AutomationError),
 }
 
+impl UsageError {
+    /// This error as one of clap's own, so it prints and exits like them (RFC-0012).
+    pub fn into_clap(self, cmd: &mut clap::Command) -> clap::error::Error {
+        let kind = match self {
+            UsageError::Conflict(..) => clap::error::ErrorKind::ArgumentConflict,
+            _ => clap::error::ErrorKind::ValueValidation,
+        };
+        cmd.error(kind, self)
+    }
+}
+
 /// A command that ran and failed: exit status 1.
 #[derive(Debug, Error)]
 pub enum Failure {

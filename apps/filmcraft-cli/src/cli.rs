@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
+
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use filmcraft_automation::BridgeClient;
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -33,6 +35,26 @@ Exit status:
   0  success
   1  a command failed, or export/render drew offline media without --allow-offline
   2  usage error";
+
+/// Parse the command line (program name first). A bare `--help` or `-h` is help even after a
+/// mistake on the same line (`export o.wav --quality 101 --help`): clap would report the mistake.
+/// Options that exclude each other on both sides of the subcommand are checked on the parsed
+/// values, where clap does not see them, and reported as clap's own errors.
+pub fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
+    let mut cmd = Cli::command();
+    let matches = match cmd.try_get_matches_from_mut(args) {
+        Err(e) if args.iter().skip(1).take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h") => {
+            let sub = args.iter().skip(1).find(|a| a.to_str().is_some_and(|n| cmd.find_subcommand(n).is_some()));
+            let argv0 = args.first().cloned().unwrap_or_default();
+            let help: Vec<OsString> = [Some(argv0), sub.cloned(), Some(OsString::from("--help"))].into_iter().flatten().collect();
+            return Err(cmd.try_get_matches_from_mut(help).err().unwrap_or(e));
+        }
+        matches => matches?,
+    };
+    let cli = Cli::from_arg_matches(&matches)?;
+    cli.global.validate().map_err(|e| e.into_clap(&mut cmd))?;
+    Ok(cli)
+}
 
 /// Options every subcommand takes; they may come before or after the subcommand.
 #[derive(Args, Debug, Clone)]

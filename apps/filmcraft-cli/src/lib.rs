@@ -16,9 +16,6 @@ mod probe;
 use std::ffi::OsString;
 use std::io::Write;
 
-use clap::Parser;
-
-use cli::Cli;
 use error::{CliError, Failure};
 use io::Io;
 
@@ -57,25 +54,24 @@ fn register_hardware_decoders() -> filmcraft_platform::Availability {
 pub fn run<I, T>(args: I, out: &mut dyn Write, err: &mut dyn Write) -> u8
 where
     I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
+    T: Into<OsString>,
 {
     let mut io = Io::new(out, err);
-    let parsed = Cli::try_parse_from(args).map_err(Parsed::Clap).and_then(|cli| cli.global.validate().map(|()| cli).map_err(|e| Parsed::Usage(e.into())));
-    let result = match parsed {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let result = match cli::parse(&args) {
         Ok(cli) => match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt.block_on(commands::dispatch(cli, &mut io)),
             Err(e) => Err(Failure::Runtime(e).into()),
         },
         // help and version go to stdout with status 0; usage errors to stderr with status 2
-        Err(Parsed::Clap(e)) if !e.use_stderr() => {
+        Err(e) if !e.use_stderr() => {
             io.text(&e.render().to_string());
             Ok(())
         }
-        Err(Parsed::Clap(e)) => {
+        Err(e) => {
             io.diag_text(&e.render().to_string());
             return u8::try_from(e.exit_code()).unwrap_or(2);
         }
-        Err(Parsed::Usage(e)) => Err(e),
     };
     let mut code = 0;
     if let Err(e) = result {
@@ -87,12 +83,6 @@ where
         code = 1;
     }
     code
-}
-
-/// Why the command line did not become a command.
-enum Parsed {
-    Clap(clap::Error),
-    Usage(CliError),
 }
 
 /// `error: <message>` on stderr; a usage error also points at `--help`, as clap's own do.
@@ -163,6 +153,28 @@ mod tests {
         assert_eq!(code, 0, "{err}");
         assert_eq!(all, bare);
         assert!(bare.contains("\"project\"") && bare.contains("\"sequence\""));
+    }
+
+    /// PhotoCraft's decision (#9194): a bare --help/-h is help even after a mistake on the line.
+    #[test]
+    fn help_is_help_even_after_a_mistake() {
+        for args in [
+            &["export", "o.wav", "--quality", "101", "--help"][..],
+            &["--demo", "export", "--fromat", "-h"],
+            &["export", "--preset", "--help"],
+            &["--demo", "--project", "p.fcproj", "export", "--help"],
+        ] {
+            let (code, out, err) = run_args(args);
+            assert_eq!((code, err.as_str()), (0, ""), "{args:?}");
+            assert!(out.contains("--allow-offline"), "{args:?}: {out}");
+        }
+        // after `--` it is a file name, not help
+        let (code, ..) = run_args(&["import", "--", "--help"]);
+        assert_ne!(code, 0);
+        // no subcommand named: the top-level help
+        let (code, out, _) = run_args(&["--nope", "--help"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("Exit status"), "{out}");
     }
 
     #[test]
