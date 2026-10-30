@@ -133,30 +133,13 @@ pub fn open_path(app: &mut FilmcraftApp, ctx: &egui::Context, path: &str, reveal
     }
 }
 
-/// What Edit Original / Reveal may hand to the OS opener for a media path. Project files and the
-/// control channel can name any string, and opening one in its default application would run
-/// whatever the OS associates with it (an executable, a script, a `scheme:` handler, a network
-/// path). Only an absolute local path to an existing regular file with a media extension goes
-/// through as asked; anything else falls back to opening the folder that contains it, or errors.
-fn safe_open_target(path: &str, reveal: bool) -> Result<(String, bool), String> {
-    let p = std::path::Path::new(path);
-    // Windows reads `\\server`, `//server` and mixed `\/server` alike as network paths: accept only a
-    // plain disk prefix (or none), whatever the separators.
-    let disk_only = p.components().next().is_none_or(|c| match c {
-        std::path::Component::Prefix(prefix) => matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)),
-        _ => true,
-    });
-    let local = p.is_absolute() && disk_only && !path.contains('\0');
-    if !local {
-        return Err(format!("`{path}` is not an absolute local path"));
-    }
-    if p.is_file() && filmcraft_media::is_importable(p) {
-        return Ok((path.to_string(), reveal));
-    }
-    match p.parent().filter(|d| d.is_dir()) {
-        Some(dir) => Ok((dir.to_string_lossy().into_owned(), false)),
-        None => Err(format!("`{path}` is not a media file and its folder does not exist")),
-    }
+/// Whether Edit Original / Reveal may hand a media path to the OS opener. Project files and the
+/// control channel can name any string; the engine's `edit.editOriginal` already refuses missing
+/// files, files that are not media, and network shares and devices. The opener also gets only an
+/// absolute path, never one the OS would resolve against the working directory.
+fn safe_open_target(path: &str) -> Result<(), String> {
+    let local = std::path::Path::new(path).is_absolute() && !filmcraft_engine::doc_path::is_network_or_device(path) && !path.contains('\0');
+    if local { Ok(()) } else { Err(format!("`{path}` is not an absolute local path")) }
 }
 
 /// Where Reveal Log Files points: `<data dir>/Logs` (the temp folder without a data directory).
@@ -220,8 +203,9 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             let r = app.session.execute(id, params.clone()).map_err(|e| e.to_string());
             return Some(r.and_then(|v| {
                 for p in v["paths"].as_array().cloned().unwrap_or_default() {
-                    let (target, reveal) = safe_open_target(p.as_str().unwrap_or_default(), reveal)?;
-                    open_path(app, ctx, &target, reveal)?;
+                    let path = p.as_str().unwrap_or_default();
+                    safe_open_target(path)?;
+                    open_path(app, ctx, path, reveal)?;
                 }
                 Ok(v)
             }));
@@ -1017,43 +1001,13 @@ pub fn search_bin_rows(
 mod open_target_tests {
     use super::safe_open_target;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("fc-open-target-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    #[test]
+    fn absolute_local_paths_pass() {
+        assert_eq!(safe_open_target(&std::env::temp_dir().join("clip.mov").to_string_lossy()), Ok(()));
     }
 
     #[test]
-    fn media_file_passes_through_unchanged() {
-        let dir = scratch("media");
-        let clip = dir.join("clip.mov");
-        std::fs::write(&clip, b"x").unwrap();
-        let path = clip.to_string_lossy().into_owned();
-        assert_eq!(safe_open_target(&path, false), Ok((path.clone(), false)));
-        assert_eq!(safe_open_target(&path, true), Ok((path, true)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn non_media_file_opens_its_folder_instead() {
-        let dir = scratch("script");
-        let script = dir.join("run.command");
-        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
-        let got = safe_open_target(&script.to_string_lossy(), false).unwrap();
-        assert_eq!(got, (dir.to_string_lossy().into_owned(), false));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn missing_media_file_opens_its_existing_folder() {
-        let dir = scratch("offline");
-        let gone = dir.join("gone.mp4");
-        assert_eq!(safe_open_target(&gone.to_string_lossy(), true), Ok((dir.to_string_lossy().into_owned(), false)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn urls_relative_unc_and_missing_folders_are_refused() {
+    fn urls_relative_and_network_paths_are_refused() {
         for bad in [
             "https://example.com/a.mp4",
             "file:///etc/passwd",
@@ -1065,8 +1019,7 @@ mod open_target_tests {
             "/\\server/share/a.mp4",
             "",
         ] {
-            assert!(safe_open_target(bad, false).is_err(), "{bad}");
+            assert!(safe_open_target(bad).is_err(), "{bad}");
         }
-        assert!(safe_open_target("/definitely/not/a/real/dir/clip.mp4", false).is_err());
     }
 }
