@@ -1286,6 +1286,80 @@ fn stabilizer_analysis_does_not_deadlock_inside_a_frame_parallel_render() {
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(60)), Ok(true), "the analyses did not finish (deadlock)");
 }
 
+/// A nested sequence's clip: fetching its frames renders the nest, whose own clips have a Warp
+/// Stabilizer that isn't analysed yet (a later clip every eight frames).
+struct NestEnv(ClipEnv);
+impl FxEnv for NestEnv {
+    fn frame(&self, dt: f64, upto: &EffectInstance) -> Option<Image> {
+        self.0.frame(dt, upto)
+    }
+    fn source_frame(&self, dt: f64, scale: f32) -> Option<Image> {
+        let k = ((self.0.now + dt) * self.0.fps).round() as u64;
+        let inner = ClipEnv { key: self.0.key ^ 0x1_0000 ^ (k / 8), secs: 0.5, ..ClipEnv { ..self.0 } };
+        // a nested clip without its path shows another picture, as an unstabilised one would
+        let shown = if stabilizer_path(&inner, 0.0, filmcraft_project::TrackMethod::Position, false).is_some() { 0.0 } else { 3.0 };
+        let t = ((self.0.now + dt) * self.0.fps).round() / self.0.fps + shown / self.0.fps;
+        Some(self.0.render(t, scale))
+    }
+    fn track(&self, index: usize) -> Option<Image> {
+        self.0.track(index)
+    }
+    fn layer_to_output(&self) -> Affine {
+        self.0.layer_to_output()
+    }
+    fn clip_seconds(&self) -> f64 {
+        self.0.clip_seconds()
+    }
+    fn clip_offset(&self) -> f64 {
+        self.0.clip_offset()
+    }
+    fn frame_rate(&self) -> f64 {
+        self.0.frame_rate()
+    }
+    fn media_timecode(&self) -> String {
+        self.0.media_timecode()
+    }
+    fn file_name(&self) -> String {
+        self.0.file_name()
+    }
+    fn sequence_name(&self) -> String {
+        self.0.sequence_name()
+    }
+    fn sequence_size(&self) -> (u32, u32) {
+        self.0.sequence_size()
+    }
+    fn source_size(&self) -> (u32, u32) {
+        self.0.source_size()
+    }
+    fn clip_key(&self) -> u64 {
+        self.0.clip_key()
+    }
+}
+
+#[test]
+fn stabilizer_analysis_of_a_nest_does_not_deadlock_on_its_clips_analyses() {
+    // the nest's analysis fetches its frames, which analyse the nested clips: they must not wait
+    // for the nest's analysis to end (it waits for them)
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let nest = || NestEnv(ClipEnv { w: 96, h: 72, fps: 24.0, secs: 1.0, now: 0.0, key: 0xBEEF_0000, seq: (96, 72), pic: shaky });
+        let method = filmcraft_project::TrackMethod::Position;
+        let cold = stabilizer_path(&nest(), 0.0, method, false).map(|p| p.steps.clone());
+        // the same analysis with every nested clip analysed first
+        super::temporal::clear_stabilizer_cache();
+        for k in 0..24 / 8 + 1 {
+            let inner = ClipEnv { key: 0xBEEF_0000 ^ 0x1_0000 ^ k, secs: 0.5, ..nest().0 };
+            let _ = stabilizer_path(&inner, 0.0, method, false);
+        }
+        let warm = stabilizer_path(&nest(), 0.0, method, false).map(|p| p.steps.clone());
+        let _ = tx.send((cold, warm));
+    });
+    let (cold, warm) = rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the nest's analysis did not finish (deadlock)");
+    assert!(cold.is_some(), "the nest has a path");
+    // a path measured on a mix of stabilised and unstabilised nested frames is not kept
+    assert_eq!(cold, warm, "the nest's path depends on which nested clips were analysed first");
+}
+
 #[test]
 fn stabilizer_analysis_ignores_frames_of_another_size() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};

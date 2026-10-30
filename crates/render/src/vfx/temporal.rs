@@ -9,6 +9,7 @@
 //! similarity model (no per-region warping).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use filmcraft_project::{EffectInstance, TrackMethod};
@@ -246,9 +247,40 @@ pub fn clear_stabilizer_cache() {
 /// long the clip is (#1895: every frame of a 15 s clip at once took 3 GB).
 const ANALYSIS_CHUNK: usize = 16;
 
-/// Only one clip is analysed at a time: the analysis already uses every rayon worker, and several
-/// renders asking for the same clip's path (playback workers) must not each run it.
-static ANALYSING: Mutex<()> = Mutex::new(());
+/// The clips being analysed (their path keys): several renders asking for the same clip's path
+/// (playback workers) must not each run it. Other clips don't wait: a nest's analysis fetches its
+/// frames by rendering the nest, which analyses the nested clips, so one lock for every clip would
+/// have the nest wait for its clips and its clips for the nest (a deadlock).
+static ANALYSING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// How often an analysis worker found a clip claimed elsewhere and drew it unstabilised. An
+/// analysis that saw this change measured some nested frames stabilised and some not, so its
+/// result is not kept.
+static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// How often a mixed analysis is run again (the nested clips are cached by then) before giving up.
+const ANALYSIS_ATTEMPTS: usize = 3;
+
+/// `key` marked as being analysed until this is dropped.
+struct Analysing(u64);
+
+impl Analysing {
+    /// Marks `key` as being analysed, or None when it already is.
+    fn claim(key: u64) -> Option<Self> {
+        let mut keys = ANALYSING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if keys.contains(&key) {
+            return None;
+        }
+        keys.push(key);
+        Some(Analysing(key))
+    }
+}
+
+impl Drop for Analysing {
+    fn drop(&mut self) {
+        ANALYSING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|k| *k != self.0);
+    }
+}
 
 /// The pool the analysis runs on, apart from the one that renders frames (None: it can't be built,
 /// as on the web build, which can't make threads).
@@ -262,8 +294,13 @@ fn analysis_pool() -> Option<&'static rayon::ThreadPool> {
 /// and that frame would wait for `ANALYSING` under the worker that holds it (a deadlock). Without a
 /// pool, `inline` runs it on this thread: where threads can't be made (the web build) rayon's
 /// global pool runs everything here, so nothing can steal. A native build without a pool gives up.
+/// Asked on one of the pool's own workers (a nest's analysis fetching a frame that analyses a
+/// nested clip), it runs right there: on a new thread it would queue behind workers that wait for it.
 pub(crate) fn run_analysis<R: Send>(pool: Option<&rayon::ThreadPool>, inline: bool, job: impl FnOnce() -> Option<R> + Send) -> Option<R> {
     let Some(pool) = pool else { return if inline { job() } else { None } };
+    if pool.current_thread_index().is_some() {
+        return job();
+    }
     std::thread::scope(|s| {
         let job = std::thread::Builder::new().name("stabilizer-analysis".into()).spawn_scoped(s, || pool.install(job));
         job.ok()?.join().ok()?
@@ -321,21 +358,25 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     if let Some(p) = cached() {
         return Some(p);
     }
-    // wait for a running analysis (it may be this clip's), giving up when this request is cancelled
+    // wait while this clip is being analysed elsewhere, giving up when this request is cancelled
     let _turn = loop {
-        match ANALYSING.try_lock() {
-            Ok(g) => break g,
-            Err(std::sync::TryLockError::Poisoned(g)) => break g.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if filmcraft_media::cancel::cancelled() {
-                    return None;
-                }
-                if let Some(p) = cached() {
-                    return Some(p);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+        if let Some(turn) = Analysing::claim(key) {
+            break turn;
         }
+        // An analysis worker never waits: it may hold this very clip's analysis further up its
+        // stack (rayon runs other queued work while it waits on its own), or wait on a worker that
+        // waits on it. The nest frame it fetches gets this clip unstabilised instead.
+        if analysis_pool().is_some_and(|p| p.current_thread_index().is_some()) {
+            SKIPPED.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
+        if filmcraft_media::cancel::cancelled() {
+            return None;
+        }
+        if let Some(p) = cached() {
+            return Some(p);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     };
     if let Some(p) = cached() {
         return Some(p);
@@ -363,7 +404,18 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
             track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY)
         })
     };
-    let steps = run_analysis(analysis_pool(), cfg!(target_family = "wasm"), || chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track))?;
+    // A run that skipped a nested clip's analysis is thrown away and repeated; one still mixed
+    // after the attempts is returned uncached, so a later request retries.
+    let mut steps = None;
+    for _ in 0..ANALYSIS_ATTEMPTS {
+        let skipped = SKIPPED.load(Ordering::SeqCst);
+        let run = run_analysis(analysis_pool(), cfg!(target_family = "wasm"), || chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track))?;
+        if SKIPPED.load(Ordering::SeqCst) == skipped {
+            steps = Some(run);
+            break;
+        }
+    }
+    let steps = steps?;
     let (w, h) = dims.get().copied()?;
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {
