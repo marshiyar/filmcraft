@@ -250,10 +250,24 @@ const ANALYSIS_CHUNK: usize = 16;
 /// renders asking for the same clip's path (playback workers) must not each run it.
 static ANALYSING: Mutex<()> = Mutex::new(());
 
-/// The pool the analysis runs on, apart from the one that renders frames (None: it can't be built).
+/// The pool the analysis runs on, apart from the one that renders frames (None: it can't be built,
+/// as on the web build, which can't make threads).
 fn analysis_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().thread_name(|i| format!("stabilizer-{i}")).build().ok()).as_ref()
+}
+
+/// Run `job` on the analysis' own `pool`, entered from a plain thread: a worker of the pool that
+/// renders frames would steal another frame while it waits (also when it waits on a foreign pool),
+/// and that frame would wait for `ANALYSING` under the worker that holds it (a deadlock). Without a
+/// pool, `inline` runs it on this thread: where threads can't be made (the web build) rayon's
+/// global pool runs everything here, so nothing can steal. A native build without a pool gives up.
+pub(crate) fn run_analysis<R: Send>(pool: Option<&rayon::ThreadPool>, inline: bool, job: impl FnOnce() -> Option<R> + Send) -> Option<R> {
+    let Some(pool) = pool else { return if inline { job() } else { None } };
+    std::thread::scope(|s| {
+        let job = std::thread::Builder::new().name("stabilizer-analysis".into()).spawn_scoped(s, || pool.install(job));
+        job.ok()?.join().ok()?
+    })
 }
 
 /// The step between two prepared frames of sizes `a` and `b`: `track` when they match in both
@@ -349,16 +363,7 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
             track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY)
         })
     };
-    // Run on the analysis' own pool, entered from a plain thread: a worker of the pool that renders
-    // frames would steal another frame while it waits (also when it waits on a foreign pool), and
-    // that frame would wait for `ANALYSING` under the worker that holds it (a deadlock).
-    let pool = analysis_pool()?;
-    let steps = std::thread::scope(|s| {
-        let job = std::thread::Builder::new()
-            .name("stabilizer-analysis".into())
-            .spawn_scoped(s, || pool.install(|| chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track)));
-        job.ok()?.join().ok()?
-    })?;
+    let steps = run_analysis(analysis_pool(), cfg!(target_family = "wasm"), || chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track))?;
     let (w, h) = dims.get().copied()?;
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {

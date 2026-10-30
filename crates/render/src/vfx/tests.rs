@@ -1252,6 +1252,17 @@ fn stabilizer_analysis_stops_when_cancelled_and_skips_missing_frames() {
 }
 
 #[test]
+fn stabilizer_analysis_runs_here_where_no_pool_can_be_built() {
+    // the web build can't make threads: its own pool fails to build, and the analysis runs on this
+    // thread (rayon's global pool runs everything there); a native build without a pool gives up
+    // rather than run inline on a render worker (the deadlock below)
+    assert_eq!(super::temporal::run_analysis(None, true, || Some(7)), Some(7));
+    assert_eq!(super::temporal::run_analysis(None, false, || Some(7)), None);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("pool");
+    assert_eq!(super::temporal::run_analysis(Some(&pool), false, || Some(7)), Some(7));
+}
+
+#[test]
 fn stabilizer_analysis_does_not_deadlock_inside_a_frame_parallel_render() {
     // export renders frames with rayon; a frame that needs an analysis must not block the pool
     // (the worker holding the analysis lock stole another frame that waited for the same lock)
