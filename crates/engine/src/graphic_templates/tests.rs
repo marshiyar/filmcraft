@@ -488,3 +488,58 @@ fn fonts_used_flags_substituted_style() {
     let bold = row("Bold").unwrap_or_else(|| panic!("{used}"));
     assert_eq!((bold["missing"].clone(), bold["substituted"].clone()), (json!(false), json!(false)), "{used}");
 }
+
+/// Issue #3577: favourites and recent fonts live in the preferences.
+#[test]
+fn font_favourites_and_recent() {
+    let mut s = demo("gt-fonts-fav");
+    let r = s.execute("graphics.fonts.favourite", json!({"family": "Noto Serif"})).unwrap();
+    assert_eq!(r["favourites"], json!(["Noto Serif"]));
+    let r = s.execute("graphics.fonts.favourite", json!({"family": "noto serif", "on": true})).unwrap();
+    assert_eq!(r["favourites"], json!(["Noto Serif"]), "no duplicates, case-insensitive");
+    assert_eq!(s.prefs.fonts.favourites, ["Noto Serif"]);
+    let r = s.execute("graphics.fonts.favourite", json!({"family": "Noto Serif"})).unwrap();
+    assert_eq!(r["favourites"], json!([]), "toggles off");
+    for f in ["A", "B", "C", "D", "E", "F", "B"] {
+        s.execute("graphics.fonts.recent", json!({"family": f})).unwrap();
+    }
+    assert_eq!(s.prefs.fonts.recent, ["B", "F", "E", "D", "C"], "deduplicated, newest first, capped at 5");
+}
+
+#[test]
+fn font_prefs_round_trip() {
+    let mut p = crate::autosave::Preferences::default();
+    p.fonts.set_favourite("Inter", None);
+    p.fonts.push_recent("Inter");
+    let back: crate::autosave::Preferences = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(back.fonts, p.fonts);
+    let old: crate::autosave::Preferences = serde_json::from_str("{}").unwrap();
+    assert_eq!(old.fonts, Default::default());
+}
+
+#[test]
+fn font_prefs_are_sanitized_when_set_or_loaded() {
+    let many: Vec<String> = (0..2000).map(|i| if i % 2 == 0 { "Inter".to_string() } else { format!("F{i}") }).collect();
+    let check = |f: &crate::autosave::FontPrefs| {
+        assert!(f.recent.len() <= crate::autosave::RECENT_FONTS_MAX, "{}", f.recent.len());
+        assert!(f.favourites.len() <= crate::autosave::FAVOURITE_FONTS_MAX);
+        assert_eq!(f.recent.iter().filter(|x| *x == "Inter").count(), 1);
+        assert!(f.favourites.iter().all(|x| !x.is_empty()));
+    };
+    let mut with_empty = many.clone();
+    with_empty.push(String::new());
+    let loaded = crate::autosave::Preferences::from_value(json!({"fonts": {"recent": many, "favourites": with_empty}}));
+    check(&loaded.fonts);
+    let mut s = demo("gt-fonts-sanitize");
+    s.execute("prefs.set", json!({"key": "fonts.recent", "value": many})).unwrap();
+    check(&s.prefs.fonts);
+}
+
+#[test]
+fn font_commands_ignore_oversized_names() {
+    let mut s = demo("gt-fonts-long");
+    let long = "x".repeat(crate::autosave::FONT_NAME_MAX + 1);
+    s.execute("graphics.fonts.favourite", json!({"family": long})).unwrap();
+    s.execute("graphics.fonts.recent", json!({"family": long})).unwrap();
+    assert!(s.prefs.fonts.favourites.is_empty() && s.prefs.fonts.recent.is_empty());
+}

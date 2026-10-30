@@ -569,6 +569,7 @@ pub fn properties(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 _ => String::new(),
             };
             let fams = filmcraft_text::families();
+            let font_prefs = app.session.prefs.fonts.clone();
             let resolved = filmcraft_text::resolve(&family, &style);
             let (_, mut vui) = cx.row(ui, tl!("Font"));
             let family_label = if resolved.missing { format!("⚠ {family}") } else { family.clone() };
@@ -576,11 +577,11 @@ pub fn properties(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if !filmcraft_text::fonts::system_scanned() {
                     filmcraft_text::fonts::scan_system();
                 }
-                for (f, _) in &fams {
-                    if ui.selectable_label(*f == family, f).clicked() {
-                        cx.set("font", json!(f));
-                    }
+                let out = font_menu(ui, &fams, &family, &font_prefs, &mut |name, rect| cx.auto(&format!("font.option.{name}"), rect, name));
+                if let Some(f) = out.picked {
+                    cx.set("font", json!(f));
                 }
+                cx.actions.extend(out.actions);
             });
             let response = crate::widgets::accessible_name(r.response, "Font");
             cx.auto("font", response.rect, "Font");
