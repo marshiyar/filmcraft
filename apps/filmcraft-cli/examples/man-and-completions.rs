@@ -1,6 +1,6 @@
 //! Writes shell completions (bash, zsh, fish, elvish, PowerShell) and man pages (one per
 //! subcommand) generated from the CLI's clap definition (RFC-0012):
-//! `cargo run -p filmcraft-cli --example generate -- <out-dir>`.
+//! `cargo run -p filmcraft-cli --example man-and-completions -- <out-dir>`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ enum GenerateError {
 impl std::fmt::Display for GenerateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GenerateError::Usage => write!(f, "usage: generate <out-dir>"),
+            GenerateError::Usage => write!(f, "usage: man-and-completions <out-dir>"),
             GenerateError::Io(e) => write!(f, "{e}"),
         }
     }
