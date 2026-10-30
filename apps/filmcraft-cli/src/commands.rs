@@ -365,14 +365,9 @@ pub fn set_custom_bounds(p: &mut Value, start: Option<f64>, end: Option<f64>) {
 pub async fn dispatch(cli: Cli, io: &mut Io<'_>) -> Result<(), CliError> {
     use crate::cli::Command;
     let Cli { global: g, command } = cli;
-    if let Command::Version = command {
-        io.line(format_args!("filmcraft-cli {}", env!("CARGO_PKG_VERSION")));
-        return Ok(());
-    }
     crate::register_hardware_decoders();
     crate::register_gpu_frame_renderer();
     match command {
-        Command::Version => Ok(()),
         Command::Probe(a) => probe(&g, a, io).await,
         Command::BenchDecode(a) => bench_decode(a, io).await,
         Command::Commands(a) => commands(&g, a, io).await,

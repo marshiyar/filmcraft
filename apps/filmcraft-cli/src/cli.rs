@@ -120,9 +120,6 @@ pub enum Command {
     BenchDecode(BenchDecodeArgs),
     /// Serve MCP on stdio (headless, or --bridge to the live app).
     Mcp,
-    /// Print the version (same as --version).
-    #[command(hide = true)]
-    Version,
 }
 
 #[derive(Args, Debug)]
@@ -452,6 +449,7 @@ mod tests {
             "bench-decode a.mov --frames 0",
             "import",
             "frobnicate",
+            "version",
         ] {
             let e = parse(s).unwrap_err();
             assert_eq!(e.exit_code(), 2, "{s}: {e}");

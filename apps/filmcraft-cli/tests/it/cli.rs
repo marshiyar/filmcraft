@@ -30,10 +30,20 @@ fn help_and_usage_errors() {
 #[test]
 fn version_after_global_options() {
     let want = format!("filmcraft-cli {}\n", env!("CARGO_PKG_VERSION"));
-    for args in [&["--version"][..], &["-V"], &["version"], &["--demo", "--version"], &["--compact", "-V"], &["--demo", "version"]] {
+    for args in [&["--version"][..], &["-V"], &["--demo", "--version"], &["--compact", "-V"]] {
         let o = cli(args);
         assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(String::from_utf8_lossy(&o.stdout), want, "{args:?}");
+    }
+}
+
+/// RFC-0012 and photocraft's decision: the version is `--version` / `-V`, not a subcommand.
+#[test]
+fn there_is_no_version_subcommand() {
+    for args in [&["version"][..], &["--demo", "version"]] {
+        let o = cli(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty() && String::from_utf8_lossy(&o.stderr).starts_with("error:"), "{args:?}");
     }
 }
 
