@@ -438,3 +438,26 @@ fn a_sideways_trackpad_swipe_with_ctrl_held_scrolls_instead_of_dropping() {
     d.frames(3);
     assert_eq!(d.view(), (6.0, 50.0, 0.0, 0.0), "scrolled 2 s later, zoom unchanged");
 }
+
+/// #3306 review: a Ctrl-held trackpad gesture is a pinch only when it is mostly vertical; a mostly
+/// horizontal swipe with a little vertical drift scrolls sideways.
+#[test]
+fn a_mostly_horizontal_ctrl_swipe_scrolls_even_with_a_little_vertical_drift() {
+    for drift in [1.0, -3.0, 20.0] {
+        let mut d = Driver::tall();
+        let tracks = d.rect("timeline.tracks");
+        let over_tracks = egui::pos2(tracks[0] + tracks[2] * 0.5, tracks[1] + tracks[3] * 0.2);
+        d.harness.input_mut().events.push(egui::Event::PointerMoved(over_tracks));
+        d.harness.input_mut().events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            source: egui::MouseWheelSource::Unknown,
+            delta: egui::vec2(-100.0, drift),
+            modifiers: egui::Modifiers::CTRL,
+            phase: egui::TouchPhase::Move,
+        });
+        d.frames(3);
+        let (scroll, pps, ..) = d.view();
+        assert_eq!(pps, 50.0, "drift {drift}: no zoom");
+        assert!(scroll > 4.0, "drift {drift}: scrolled sideways, at {scroll}");
+    }
+}
