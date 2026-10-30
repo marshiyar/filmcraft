@@ -155,6 +155,9 @@ fn shift_track(seq: &Sequence, tid: TrackId, delta: i32) -> Option<TrackId> {
     Some(tid)
 }
 
+/// Points of Ctrl + trackpad scroll that scale the zoom by e (egui's own zoom-by-scroll rate).
+const PINCH_POINTS: f32 = 200.0;
+
 /// What the wheel and the trackpad did this frame.
 pub(crate) struct WheelInput {
     /// Scroll in points (wheel lines and pages converted), positive = content moves right / down.
@@ -174,12 +177,30 @@ pub(crate) fn wheel_input(ctx: &egui::Context) -> WheelInput {
         let mut w = WheelInput { delta: egui::Vec2::ZERO, pinch: 1.0, command: false, alt: false, shift: false };
         for e in &i.events {
             match e {
-                egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
+                egui::Event::MouseWheel { unit, delta, modifiers, source, .. } => {
                     let points = match unit {
                         egui::MouseWheelUnit::Point => 1.0,
                         egui::MouseWheelUnit::Line => 40.0,
                         egui::MouseWheelUnit::Page => 400.0,
                     };
+                    // On Windows and Linux a trackpad pinch arrives as Ctrl + wheel (#3306): a
+                    // zoom, spreading zooms in as Zoom does. Those backends cannot say where a
+                    // wheel event came from (`Unknown`), but a mouse wheel turns in whole lines
+                    // while a trackpad gives points or fractions of a line. A mouse wheel with
+                    // Ctrl held is still the sideways scroll.
+                    let trackpad = match source {
+                        egui::MouseWheelSource::Trackpad | egui::MouseWheelSource::Momentum => true,
+                        egui::MouseWheelSource::Unknown => {
+                            matches!(unit, egui::MouseWheelUnit::Point) || (matches!(unit, egui::MouseWheelUnit::Line) && delta.y.fract() != 0.0)
+                        }
+                        _ => false,
+                    };
+                    if modifiers.ctrl && !modifiers.mac_cmd && trackpad {
+                        if delta.y.is_finite() {
+                            w.pinch *= (delta.y * points / PINCH_POINTS).clamp(-1.0, 1.0).exp();
+                        }
+                        continue;
+                    }
                     if delta.x.is_finite() && delta.y.is_finite() {
                         w.delta += *delta * points;
                     }
