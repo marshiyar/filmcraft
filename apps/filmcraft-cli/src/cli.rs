@@ -60,7 +60,7 @@ pub fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
 #[derive(Args, Debug, Clone)]
 pub struct Global {
     /// Open this project first (headless).
-    #[arg(long, global = true, value_name = "P.FCPROJ", conflicts_with_all = ["demo", "bridge"])]
+    #[arg(long, global = true, value_name = "P.FCPROJ", value_parser = path, conflicts_with_all = ["demo", "bridge"])]
     pub project: Option<PathBuf>,
     /// Open the built-in demo project (headless).
     #[arg(long, global = true, conflicts_with = "bridge")]
@@ -69,13 +69,14 @@ pub struct Global {
     #[arg(long, global = true, conflicts_with = "save_as")]
     pub save: bool,
     /// Save the project to this path when done.
-    #[arg(long, global = true, value_name = "P.FCPROJ")]
+    #[arg(long, global = true, value_name = "P.FCPROJ", value_parser = path)]
     pub save_as: Option<PathBuf>,
-    /// Send commands to the running app (`filmcraft --control PORT`) instead of a headless engine.
+    /// Send commands to the running app (`filmcraft --control PORT`) instead of a headless engine; a
+    /// bare port means 127.0.0.1:PORT.
     #[arg(long, global = true, value_name = "127.0.0.1:PORT", value_parser = parse_bridge)]
     pub bridge: Option<BridgeAddr>,
     /// FilmCraft data directory for user export presets (headless; default: the app's data directory).
-    #[arg(long, global = true, value_name = "DIR")]
+    #[arg(long, global = true, value_name = "DIR", value_parser = path)]
     pub data_dir: Option<PathBuf>,
     /// Print JSON on one line.
     #[arg(long, global = true)]
@@ -106,8 +107,13 @@ impl Global {
 #[derive(Debug, Clone)]
 pub struct BridgeAddr(pub String);
 
+/// `PORT` alone is the app on this machine: `127.0.0.1:PORT`.
 fn parse_bridge(s: &str) -> Result<BridgeAddr, filmcraft_automation::AutomationError> {
-    BridgeClient::new(s).map(|_| BridgeAddr(s.to_string()))
+    let addr = match s.parse::<u16>() {
+        Ok(port) => format!("127.0.0.1:{port}"),
+        Err(_) => s.to_string(),
+    };
+    BridgeClient::new(addr.as_str()).map(|_| BridgeAddr(addr))
 }
 
 #[derive(Subcommand, Debug)]
@@ -147,6 +153,7 @@ pub enum Command {
 #[derive(Args, Debug)]
 pub struct ExecArgs {
     /// Command id (see `commands`).
+    #[arg(value_parser = text)]
     pub id: String,
     /// Parameters: `key=value` pairs (dotted keys nest: `color.r=1`), or one JSON object.
     #[arg(value_parser = ParamArg::parse, value_name = "KEY=VALUE")]
@@ -212,7 +219,7 @@ pub fn parse_value(s: &str) -> Value {
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// The script file, or `-` for standard input.
-    #[arg(value_name = "SCRIPT.JSONL")]
+    #[arg(value_name = "SCRIPT.JSONL", value_parser = path)]
     pub script: PathBuf,
     /// Report failing lines and continue.
     #[arg(long)]
@@ -231,6 +238,7 @@ pub struct CommandsArgs {
 #[derive(Args, Debug)]
 pub struct DescribeArgs {
     /// Command id.
+    #[arg(value_parser = text)]
     pub id: String,
 }
 
@@ -252,23 +260,23 @@ pub enum InspectTarget {
 #[derive(Args, Debug)]
 pub struct ImportArgs {
     /// Media files; paths are stored absolute.
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(required = true, value_name = "FILE", value_parser = path)]
     pub files: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct ExportArgs {
     /// The output file; with --list-presets, a filter for the preset names.
-    #[arg(required_unless_present = "list_presets", value_name = "OUT")]
+    #[arg(required_unless_present = "list_presets", value_name = "OUT", value_parser = path)]
     pub out: Option<PathBuf>,
     /// List export presets (name, category, format) as JSON.
     #[arg(long, conflicts_with_all = ["preset", "format", "range", "start", "end", "settings", "gpu_rendering", "scale", "quality", "no_audio", "queue", "allow_offline"])]
     pub list_presets: bool,
     /// Export preset name (built-in or the user's).
-    #[arg(long)]
+    #[arg(long, value_parser = text)]
     pub preset: Option<String>,
     /// Format: h264, hevc, prores, dnxhr, apv, mjpeg, mxf-op1a, mxf-opatom, png, tiff, bmp, gif, wav, aiff or aac (default: guessed from the extension).
-    #[arg(long)]
+    #[arg(long, value_parser = text)]
     pub format: Option<String>,
     /// Range to export.
     #[arg(long, value_enum, conflicts_with_all = ["start", "end"])]
@@ -343,7 +351,7 @@ pub struct RenderArgs {
     #[arg(long, default_value_t = 0.0, value_name = "SECONDS", value_parser = finite::<f64>, allow_negative_numbers = true)]
     pub seconds: f64,
     /// Output PNG.
-    #[arg(long, default_value = "frame.png", value_name = "FILE.PNG")]
+    #[arg(long, default_value = "frame.png", value_name = "FILE.PNG", value_parser = path)]
     pub out: PathBuf,
     /// Render at a fraction of the frame size (0.5 = half).
     #[arg(long, default_value_t = 1.0, value_parser = finite::<f32>, allow_negative_numbers = true)]
@@ -356,6 +364,7 @@ pub struct RenderArgs {
 #[derive(Args, Debug)]
 pub struct ProbeArgs {
     /// Media file.
+    #[arg(value_parser = path)]
     pub media: PathBuf,
     /// `media` is the first numbered still of an image sequence.
     #[arg(long)]
@@ -365,6 +374,7 @@ pub struct ProbeArgs {
 #[derive(Args, Debug)]
 pub struct BenchDecodeArgs {
     /// Media file.
+    #[arg(value_parser = path)]
     pub media: PathBuf,
     /// Frames to decode.
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(i64).range(1..))]
@@ -373,6 +383,8 @@ pub struct BenchDecodeArgs {
 
 #[derive(Debug, Error)]
 pub enum ValueError {
+    #[error("a value is required")]
+    Empty,
     #[error("expected a finite number, got `{0}`")]
     NotFinite(String),
 }
@@ -383,6 +395,15 @@ fn finite<T: std::str::FromStr + Copy + Into<f64>>(s: &str) -> Result<T, ValueEr
         Ok(n) if n.into().is_finite() => Ok(n),
         _ => Err(ValueError::NotFinite(s.to_string())),
     }
+}
+
+/// A value that is not empty (`--project ""` names nothing).
+fn text(s: &str) -> Result<String, ValueError> {
+    if s.is_empty() { Err(ValueError::Empty) } else { Ok(s.to_string()) }
+}
+
+fn path(s: &str) -> Result<PathBuf, ValueError> {
+    text(s).map(PathBuf::from)
 }
 
 fn parse_json(s: &str) -> Result<Value, serde_json::Error> {
@@ -472,6 +493,8 @@ mod tests {
             "import",
             "frobnicate",
             "version",
+            "--project= exec x",
+            "export out.wav --preset=",
         ] {
             let e = parse(s).unwrap_err();
             assert_eq!(e.exit_code(), 2, "{s}: {e}");
@@ -499,6 +522,16 @@ mod tests {
         }
         let Ok(c) = parse("--demo exec x --save --compact") else { panic!() };
         assert!(c.global.validate().is_ok());
+    }
+
+    #[test]
+    fn a_bare_bridge_port_means_the_local_app() {
+        let Ok(c) = parse("--bridge 7878 exec x") else { panic!() };
+        assert_eq!(c.global.bridge.map(|b| b.0).as_deref(), Some("127.0.0.1:7878"));
+        let Ok(c) = parse("--bridge=127.0.0.1:9876 exec x") else { panic!() };
+        assert_eq!(c.global.bridge.map(|b| b.0).as_deref(), Some("127.0.0.1:9876"));
+        assert!(parse("--bridge 0.0.0.0:9876 exec x").is_err(), "not a loopback address");
+        assert!(parse("--bridge 70000 exec x").is_err());
     }
 
     #[test]
