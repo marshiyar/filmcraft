@@ -4982,9 +4982,10 @@ fn with_absolute_media(s: &Session) -> filmcraft_project::Project {
     for media in project.items.values_mut().filter_map(|i| i.as_media_mut()) {
         for r in std::iter::once(&mut media.media).chain(media.proxy.iter_mut()) {
             if let filmcraft_project::MediaRef::File { path } = r
-                && let Ok(abs) = s.media.follow(path)
+                && let Ok(followed) = s.media.follow(path)
             {
-                *path = abs;
+                // a path the user picked in this session is followed as given: relative to the working directory
+                *path = std::path::absolute(&followed).ok().and_then(|p| p.into_os_string().into_string().ok()).unwrap_or(followed);
             }
         }
     }
@@ -5005,29 +5006,39 @@ fn snapshot_dirty(s: &Session) -> Result<Option<String>> {
     let name = auto_save_name(s);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     let offset_at = |unix: i64| s.persistence.as_ref().map_or(0, |p| (p.local_offset)(unix));
-    // Names have a one second resolution and rotation drops the oldest: this version must sort after every
-    // retained one, or it could replace one taken in the same second or be rotated out at once.
-    let newest =
-        filmcraft_format::autosave::list_auto_saves(&dir, &name).iter().filter_map(|p| p.file_stem()?.to_str()?.rsplit('-').next()?.parse::<i64>().ok()).max();
-    let unix = match newest {
-        Some(n) => {
-            n.checked_add(1).ok_or_else(|| EngineError::Other("could not snapshot the unsaved project: no newer auto-save time is available".into()))?.max(now)
-        }
-        None => now,
-    };
     let max = usize::try_from(s.prefs.auto_save.max_versions).unwrap_or(usize::MAX).max(1);
-    let path = dir.join(filmcraft_format::autosave::auto_save_name(&name, unix, offset_at(unix)));
-    let write = std::fs::create_dir_all(&dir).and_then(|()| filmcraft_format::atomic_write(&path, &bytes));
-    write.map_err(|e| EngineError::Other(format!("could not snapshot the unsaved project before replacing it: {e}")))?;
-    // a version the auto-save list cannot find would not protect anything
-    if !filmcraft_format::autosave::list_auto_saves(&dir, &name).contains(&path) {
-        let _ = std::fs::remove_file(&path);
-        return Err(EngineError::Other("could not snapshot the unsaved project: its auto-save time is out of range".into()));
+    // The auto-save worker can write and rotate this folder while the snapshot is taken (`flush` is no write
+    // barrier), and with a short version limit its rotation could remove the snapshot just written. So the
+    // snapshot is checked after rotating and taken again when it is gone, a few times, before giving up.
+    for _ in 0..4 {
+        // Names have a one second resolution and rotation drops the oldest: this version must sort after every
+        // retained one, or it could replace one taken in the same second or be rotated out at once.
+        let newest = filmcraft_format::autosave::list_auto_saves(&dir, &name)
+            .iter()
+            .filter_map(|p| p.file_stem()?.to_str()?.rsplit('-').next()?.parse::<i64>().ok())
+            .max();
+        let unix = match newest {
+            Some(n) => n
+                .checked_add(1)
+                .ok_or_else(|| EngineError::Other("could not snapshot the unsaved project: no newer auto-save time is available".into()))?
+                .max(now),
+            None => now,
+        };
+        let path = dir.join(filmcraft_format::autosave::auto_save_name(&name, unix, offset_at(unix)));
+        let write = std::fs::create_dir_all(&dir).and_then(|()| filmcraft_format::atomic_write(&path, &bytes));
+        write.map_err(|e| EngineError::Other(format!("could not snapshot the unsaved project before replacing it: {e}")))?;
+        // a version the auto-save list cannot find would not protect anything
+        if !filmcraft_format::autosave::list_auto_saves(&dir, &name).contains(&path) {
+            let _ = std::fs::remove_file(&path);
+            return Err(EngineError::Other("could not snapshot the unsaved project: its auto-save time is out of range".into()));
+        }
+        // Pruning old versions is best effort: a lost race with the worker's rotation must not stop the replacement
+        let _ = filmcraft_format::autosave::rotate(&dir, &name, max);
+        if path.exists() {
+            return Ok(Some(path.to_string_lossy().into_owned()));
+        }
     }
-    // Pruning old versions is best effort: the auto-save worker may be rotating the same folder, and a
-    // lost race there must not stop the replacement the snapshot already protects.
-    let _ = filmcraft_format::autosave::rotate(&dir, &name, max);
-    Ok(Some(path.to_string_lossy().into_owned()))
+    Err(EngineError::Other("could not snapshot the unsaved project: its copy kept being removed by the auto-save rotation".into()))
 }
 
 /// Where auto-saves of the current project go.

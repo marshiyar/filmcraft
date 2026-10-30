@@ -323,3 +323,36 @@ fn a_snapshot_keeps_document_relative_media_pointing_at_the_original_files() {
     };
     assert_eq!(std::path::Path::new(&path), std::path::Path::new(&want), "the snapshot names the original file, not one beside the auto-save");
 }
+
+#[test]
+fn a_snapshot_names_a_relative_path_picked_in_this_session_absolutely() {
+    let (mut s, _d) = snapshot_session("snap-picked");
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let id = *s.project.items.iter().find(|(_, i)| i.as_media().is_some()).map(|(id, _)| id).unwrap();
+    let picked = "picked/clip.mp4";
+    std::sync::Arc::make_mut(&mut s.project).items.get_mut(&id).and_then(|i| i.as_media_mut()).unwrap().media =
+        filmcraft_project::MediaRef::File { path: picked.into() };
+    s.media.allow(picked);
+    s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let snap = s.execute("file.newProject", json!({"name": "Next"})).unwrap()["snapshot"].as_str().unwrap().to_string();
+    let restored = filmcraft_format::decode(&std::fs::read(&snap).unwrap()).unwrap().project;
+    let Some(filmcraft_project::MediaRef::File { path }) = restored.items.get(&id).and_then(|i| i.as_media()).map(|m| m.media.clone()) else {
+        panic!("file media")
+    };
+    assert!(std::path::Path::new(&path).is_absolute(), "{path}");
+    assert!(path.ends_with(picked), "{path}");
+}
+
+#[test]
+fn a_one_version_limit_keeps_the_snapshot_with_the_auto_save_worker_running() {
+    let (mut s, _d) = snapshot_session("snap-worker");
+    s.prefs.auto_save.max_versions = 1;
+    for n in 0..20 {
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        s.execute("sequence.addEdit", json!({"seconds": 1.0 + f64::from(n)})).unwrap();
+        // the worker writes (and rotates) in the same folder right before the replacement
+        let _ = s.execute("file.autoSaveNow", json!({}));
+        let snap = s.execute("file.newProject", json!({"name": "Same"})).unwrap()["snapshot"].as_str().unwrap().to_string();
+        assert!(std::path::Path::new(&snap).exists(), "round {n}: the snapshot {snap} survives the worker's rotation");
+    }
+}
