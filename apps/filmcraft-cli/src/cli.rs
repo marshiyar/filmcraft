@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use std::ffi::OsString;
 
+use clap::builder::PathBufValueParser;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use filmcraft_automation::BridgeClient;
 use serde_json::{Map, Value};
@@ -40,11 +41,24 @@ Exit status:
 /// mistake on the same line (`export o.wav --quality 101 --help`): clap would report the mistake.
 /// Options that exclude each other on both sides of the subcommand are checked on the parsed
 /// values, where clap does not see them, and reported as clap's own errors.
+/// The global options that take a value in the next word.
+const VALUE_GLOBALS: [&str; 4] = ["--project", "--save-as", "--bridge", "--data-dir"];
+
 pub fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
     let mut cmd = Cli::command();
     let matches = match cmd.try_get_matches_from_mut(args) {
         Err(e) if args.iter().skip(1).take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h") => {
-            let sub = args.iter().skip(1).find(|a| a.to_str().is_some_and(|n| cmd.find_subcommand(n).is_some()));
+            // the first word that names a subcommand, not counting the value of a global option
+            let mut words = args.iter().skip(1);
+            let mut sub = None;
+            while let Some(a) = words.next() {
+                if VALUE_GLOBALS.iter().any(|o| a == o) {
+                    words.next();
+                } else if a.to_str().is_some_and(|n| cmd.find_subcommand(n).is_some()) {
+                    sub = Some(a);
+                    break;
+                }
+            }
             let argv0 = args.first().cloned().unwrap_or_default();
             let help: Vec<OsString> = [Some(argv0), sub.cloned(), Some(OsString::from("--help"))].into_iter().flatten().collect();
             return Err(cmd.try_get_matches_from_mut(help).err().unwrap_or(e));
@@ -60,7 +74,7 @@ pub fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
 #[derive(Args, Debug, Clone)]
 pub struct Global {
     /// Open this project first (headless).
-    #[arg(long, global = true, value_name = "P.FCPROJ", value_parser = path, conflicts_with_all = ["demo", "bridge"])]
+    #[arg(long, global = true, value_name = "P.FCPROJ", value_parser = PathBufValueParser::new(), conflicts_with_all = ["demo", "bridge"])]
     pub project: Option<PathBuf>,
     /// Open the built-in demo project (headless).
     #[arg(long, global = true, conflicts_with = "bridge")]
@@ -69,14 +83,14 @@ pub struct Global {
     #[arg(long, global = true, conflicts_with = "save_as")]
     pub save: bool,
     /// Save the project to this path when done.
-    #[arg(long, global = true, value_name = "P.FCPROJ", value_parser = path)]
+    #[arg(long, global = true, value_name = "P.FCPROJ", value_parser = PathBufValueParser::new())]
     pub save_as: Option<PathBuf>,
     /// Send commands to the running app (`filmcraft --control PORT`) instead of a headless engine; a
     /// bare port means 127.0.0.1:PORT.
     #[arg(long, global = true, value_name = "127.0.0.1:PORT", value_parser = parse_bridge)]
     pub bridge: Option<BridgeAddr>,
     /// FilmCraft data directory for user export presets (headless; default: the app's data directory).
-    #[arg(long, global = true, value_name = "DIR", value_parser = path)]
+    #[arg(long, global = true, value_name = "DIR", value_parser = PathBufValueParser::new())]
     pub data_dir: Option<PathBuf>,
     /// Print JSON on one line.
     #[arg(long, global = true)]
@@ -219,7 +233,7 @@ pub fn parse_value(s: &str) -> Value {
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// The script file, or `-` for standard input.
-    #[arg(value_name = "SCRIPT.JSONL", value_parser = path)]
+    #[arg(value_name = "SCRIPT.JSONL", value_parser = PathBufValueParser::new())]
     pub script: PathBuf,
     /// Report failing lines and continue.
     #[arg(long)]
@@ -260,14 +274,14 @@ pub enum InspectTarget {
 #[derive(Args, Debug)]
 pub struct ImportArgs {
     /// Media files; paths are stored absolute.
-    #[arg(required = true, value_name = "FILE", value_parser = path)]
+    #[arg(required = true, value_name = "FILE", value_parser = PathBufValueParser::new())]
     pub files: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct ExportArgs {
     /// The output file; with --list-presets, a filter for the preset names.
-    #[arg(required_unless_present = "list_presets", value_name = "OUT", value_parser = path)]
+    #[arg(required_unless_present = "list_presets", value_name = "OUT", value_parser = PathBufValueParser::new())]
     pub out: Option<PathBuf>,
     /// List export presets (name, category, format) as JSON.
     #[arg(long, conflicts_with_all = ["preset", "format", "range", "start", "end", "settings", "gpu_rendering", "scale", "quality", "no_audio", "queue", "allow_offline"])]
@@ -351,7 +365,7 @@ pub struct RenderArgs {
     #[arg(long, default_value_t = 0.0, value_name = "SECONDS", value_parser = finite::<f64>, allow_negative_numbers = true)]
     pub seconds: f64,
     /// Output PNG.
-    #[arg(long, default_value = "frame.png", value_name = "FILE.PNG", value_parser = path)]
+    #[arg(long, default_value = "frame.png", value_name = "FILE.PNG", value_parser = PathBufValueParser::new())]
     pub out: PathBuf,
     /// Render at a fraction of the frame size (0.5 = half).
     #[arg(long, default_value_t = 1.0, value_parser = finite::<f32>, allow_negative_numbers = true)]
@@ -364,7 +378,7 @@ pub struct RenderArgs {
 #[derive(Args, Debug)]
 pub struct ProbeArgs {
     /// Media file.
-    #[arg(value_parser = path)]
+    #[arg(value_parser = PathBufValueParser::new())]
     pub media: PathBuf,
     /// `media` is the first numbered still of an image sequence.
     #[arg(long)]
@@ -374,7 +388,7 @@ pub struct ProbeArgs {
 #[derive(Args, Debug)]
 pub struct BenchDecodeArgs {
     /// Media file.
-    #[arg(value_parser = path)]
+    #[arg(value_parser = PathBufValueParser::new())]
     pub media: PathBuf,
     /// Frames to decode.
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(i64).range(1..))]
@@ -400,10 +414,6 @@ fn finite<T: std::str::FromStr + Copy + Into<f64>>(s: &str) -> Result<T, ValueEr
 /// A value that is not empty (`--project ""` names nothing).
 fn text(s: &str) -> Result<String, ValueError> {
     if s.is_empty() { Err(ValueError::Empty) } else { Ok(s.to_string()) }
-}
-
-fn path(s: &str) -> Result<PathBuf, ValueError> {
-    text(s).map(PathBuf::from)
 }
 
 fn parse_json(s: &str) -> Result<Value, serde_json::Error> {

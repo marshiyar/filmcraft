@@ -177,6 +177,27 @@ mod tests {
         assert!(out.contains("Exit status"), "{out}");
     }
 
+    /// An option value that is also a subcommand's name is not the subcommand help is about.
+    #[test]
+    fn help_after_a_mistake_names_the_subcommand_not_an_option_value() {
+        let (code, out, _) = run_args(&["--data-dir", "export", "render", "--scale", "NaN", "--help"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("--seconds") && !out.contains("--list-presets"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_unicode_reaches_the_parser_and_an_empty_one_does_not() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = OsString::from_vec(vec![b'x', 0xff, b'.', b'm', b'p', b'4']);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let args = [OsString::from("filmcraft-cli"), OsString::from("probe"), odd];
+        // the file does not exist: a failure (1) after parsing, not a usage error (2)
+        assert_eq!(run(args, &mut out, &mut err), 1, "{}", String::from_utf8_lossy(&err));
+        let (code, ..) = run_args(&["probe", ""]);
+        assert_eq!(code, 2);
+    }
+
     #[test]
     fn a_usage_error_is_found_before_any_work() {
         let (code, out, err) = run_args(&["--demo", "exec", "file.newBin", "--nme", "x"]);
