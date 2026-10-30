@@ -416,3 +416,22 @@ fn a_trackpad_pinch_sent_as_ctrl_wheel_zooms_the_timeline() {
     d.wheel(0.2, 0.0, -100.0, json!({"ctrl": true}));
     assert_eq!(d.view(), (6.0, 50.0, 0.0, 0.0));
 }
+
+/// #3306 review: a sideways trackpad swipe with Ctrl held has no vertical part, so it is not a
+/// pinch: it scrolls the Timeline sideways like any sideways gesture.
+#[test]
+fn a_sideways_trackpad_swipe_with_ctrl_held_scrolls_instead_of_dropping() {
+    let mut d = Driver::tall();
+    let tracks = d.rect("timeline.tracks");
+    let over_tracks = egui::pos2(tracks[0] + tracks[2] * 0.5, tracks[1] + tracks[3] * 0.2);
+    d.harness.input_mut().events.push(egui::Event::PointerMoved(over_tracks));
+    d.harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        source: egui::MouseWheelSource::Trackpad,
+        delta: egui::vec2(-100.0, 0.0),
+        modifiers: egui::Modifiers::CTRL,
+        phase: egui::TouchPhase::Move,
+    });
+    d.frames(3);
+    assert_eq!(d.view(), (6.0, 50.0, 0.0, 0.0), "scrolled 2 s later, zoom unchanged");
+}

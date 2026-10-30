@@ -195,7 +195,8 @@ pub(crate) fn wheel_input(ctx: &egui::Context) -> WheelInput {
                         }
                         _ => false,
                     };
-                    if modifiers.ctrl && !modifiers.mac_cmd && trackpad {
+                    // a swipe with no vertical part is not a pinch: it takes the sideways-scroll path below
+                    if modifiers.ctrl && !modifiers.mac_cmd && trackpad && delta.y != 0.0 {
                         if delta.y.is_finite() {
                             w.pinch *= (delta.y * points / PINCH_POINTS).clamp(-1.0, 1.0).exp();
                         }
