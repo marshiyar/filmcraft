@@ -8,6 +8,7 @@
 //! the result (crop / auto-scale / synthesise edges). Perspective and Subspace Warp use the
 //! similarity model (no per-region warping).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -253,10 +254,34 @@ const ANALYSIS_CHUNK: usize = 16;
 /// have the nest wait for its clips and its clips for the nest (a deadlock).
 static ANALYSING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// How often an analysis worker found a clip claimed elsewhere and drew it unstabilised. An
-/// analysis that saw this change measured some nested frames stabilised and some not, so its
-/// result is not kept.
-static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// The skips of the analysis whose frame this thread is fetching (the pool's workers don't
+    /// share one analysis, and a nest's frame is rendered on the worker that fetches it).
+    static SKIPS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` counting the clips it draws unstabilised (claimed elsewhere, see `stabilizer_path`) in
+/// `skips`; the worker's previous count is back after, also for an analysis run inline within one.
+fn counting_skips<R>(skips: &Arc<AtomicUsize>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Arc<AtomicUsize>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SKIPS.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SKIPS.with(|c| c.borrow_mut().replace(skips.clone())));
+    f()
+}
+
+/// Counts a clip drawn unstabilised for the analysis this thread is fetching a frame of: it
+/// measured some nested frames stabilised and some not, so its result is not kept.
+fn note_skip() {
+    SKIPS.with(|c| {
+        if let Some(n) = c.borrow().as_ref() {
+            n.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
 
 /// How often a mixed analysis is run again (the nested clips are cached by then) before giving up.
 const ANALYSIS_ATTEMPTS: usize = 3;
@@ -367,7 +392,7 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
         // stack (rayon runs other queued work while it waits on its own), or wait on a worker that
         // waits on it. The nest frame it fetches gets this clip unstabilised instead.
         if analysis_pool().is_some_and(|p| p.current_thread_index().is_some()) {
-            SKIPPED.fetch_add(1, Ordering::SeqCst);
+            note_skip();
             return None;
         }
         if filmcraft_media::cancel::cancelled() {
@@ -391,8 +416,9 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     let cancelled = || hints.clone().run(filmcraft_media::cancel::cancelled);
     // every frame has the size of the first one that exists
     let dims: OnceLock<(usize, usize)> = OnceLock::new();
+    let skips = Arc::new(AtomicUsize::new(0));
     let fetch = |k: usize| {
-        let p = env.source_frame(k as f64 / fps - now, scale).map(|f| Prepared::new(gray_of(&f)))?;
+        let p = counting_skips(&skips, || env.source_frame(k as f64 / fps - now, scale)).map(|f| Prepared::new(gray_of(&f)))?;
         let _ = dims.set((p.base().w, p.base().h));
         Some(p)
     };
@@ -408,14 +434,18 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     // after the attempts is returned uncached, so a later request retries.
     let mut steps = None;
     for _ in 0..ANALYSIS_ATTEMPTS {
-        let skipped = SKIPPED.load(Ordering::SeqCst);
+        let skipped = skips.load(Ordering::SeqCst);
         let run = run_analysis(analysis_pool(), cfg!(target_family = "wasm"), || chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track))?;
-        if SKIPPED.load(Ordering::SeqCst) == skipped {
+        if skips.load(Ordering::SeqCst) == skipped {
             steps = Some(run);
             break;
         }
     }
-    let steps = steps?;
+    let Some(steps) = steps else {
+        // drawn unstabilised for whoever fetched this frame: an analysis enclosing this one is mixed too
+        note_skip();
+        return None;
+    };
     let (w, h) = dims.get().copied()?;
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {
