@@ -4970,8 +4970,25 @@ fn snapshot_if_dirty(s: &Session, discard: bool) -> Result<Option<String>> {
             "the project has unsaved changes and nowhere to keep a copy of them: save it first, or pass `discard: true` to drop them".into(),
         )),
         Err(_) if discard => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => Err(EngineError::Other(format!("{e}; pass `discard: true` to drop the unsaved changes anyway"))),
     }
+}
+
+/// The project with its document-relative media and proxy paths made absolute: the snapshot lives in the
+/// auto-save folder, not beside the project file, so a relative path would resolve to the wrong place
+/// when it is opened (#3621). Paths that cannot be followed are left as they are.
+fn with_absolute_media(s: &Session) -> filmcraft_project::Project {
+    let mut project = (*s.project).clone();
+    for media in project.items.values_mut().filter_map(|i| i.as_media_mut()) {
+        for r in std::iter::once(&mut media.media).chain(media.proxy.iter_mut()) {
+            if let filmcraft_project::MediaRef::File { path } = r
+                && let Ok(abs) = s.media.follow(path)
+            {
+                *path = abs;
+            }
+        }
+    }
+    project
 }
 
 fn snapshot_dirty(s: &Session) -> Result<Option<String>> {
@@ -4983,7 +5000,7 @@ fn snapshot_dirty(s: &Session) -> Result<Option<String>> {
     if let Some(per) = &s.persistence {
         per.flush();
     }
-    let bytes = filmcraft_format::encode(&s.project, false);
+    let bytes = filmcraft_format::encode(&with_absolute_media(s), false);
     let dir = auto_save_dir(s);
     let name = auto_save_name(s);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));

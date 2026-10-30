@@ -300,3 +300,26 @@ fn import_replace_does_not_drop_unsaved_changes_that_cannot_be_kept() {
     assert_eq!(s.project.name, "FilmCraft Demo");
     assert!(s.is_dirty());
 }
+
+#[test]
+fn a_snapshot_keeps_document_relative_media_pointing_at_the_original_files() {
+    let (mut s, d) = snapshot_session("snap-relative");
+    let films = d.join("films");
+    std::fs::create_dir_all(&films).unwrap();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let id = *s.project.items.iter().find(|(_, i)| i.as_media().is_some()).map(|(id, _)| id).unwrap();
+    let relative = "media/clip.mp4";
+    let mut p = (*s.project).clone();
+    p.items.get_mut(&id).and_then(|i| i.as_media_mut()).unwrap().media = filmcraft_project::MediaRef::File { path: relative.into() };
+    let cut = films.join("cut.fcproj").to_string_lossy().to_string();
+    std::fs::write(&cut, filmcraft_format::encode(&p, false)).unwrap();
+    s.execute("file.open", json!({"path": cut})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let snap = s.execute("file.newProject", json!({"name": "Next"})).unwrap()["snapshot"].as_str().unwrap().to_string();
+    let restored = filmcraft_format::decode(&std::fs::read(&snap).unwrap()).unwrap().project;
+    let want = films.join(relative).to_string_lossy().to_string();
+    let Some(filmcraft_project::MediaRef::File { path }) = restored.items.get(&id).and_then(|i| i.as_media()).map(|m| m.media.clone()) else {
+        panic!("file media")
+    };
+    assert_eq!(std::path::Path::new(&path), std::path::Path::new(&want), "the snapshot names the original file, not one beside the auto-save");
+}
