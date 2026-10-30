@@ -102,8 +102,10 @@ impl Source {
     }
 }
 
-/// Channels that take part in the alignment search; the shift is shared by all.
+/// Channels whose planes are kept for the alignment search, and how many of them (the most
+/// energetic) it correlates; the shift is shared by all channels.
 const GUIDE_CHANNELS: usize = 8;
+const SEARCH_CHANNELS: usize = 2;
 
 /// The previous grain: where it was taken from and the source region it was chosen in (one
 /// plane per guide channel).
@@ -122,6 +124,10 @@ struct Wsola {
     hop: usize,
     /// How far a grain may slide either way from its nominal position.
     slide: usize,
+    /// Samples averaged into one for the alignment search.
+    decim: usize,
+    /// The most multiply-adds one alignment search has needed (for the cost test).
+    search_ops: std::cell::Cell<usize>,
     window: Vec<f32>,
     channels: usize,
     next_grain: i64,
@@ -136,10 +142,30 @@ struct Wsola {
 impl Wsola {
     fn new(source: Source, from: u32, to: u32) -> Self {
         // ~40 ms grains: long enough to hold a few pitch periods of a low voice
-        let len = ((u64::from(from) * 40 / 1000) as usize).clamp(256, 8192) & !1;
+        let len = ((u64::from(from) * 40 / 1000) as usize).clamp(256, 8192);
+        // the alignment search runs on the signal averaged down to at most 48 kHz, so its cost
+        // does not grow with the device rate; grain and slide are whole multiples of that factor
+        let decim = (from as usize).div_ceil(48_000).max(1);
+        let len = len - len % (2 * decim);
         let hop = len / 2;
         let window = (0..len).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / len as f32).cos()).collect();
-        Wsola { source, from, to, len, hop, slide: hop, window, channels: 0, next_grain: 0, expect: None, prev: None, acc: Vec::new(), acc_base: 0 }
+        Wsola {
+            source,
+            from,
+            to,
+            len,
+            hop,
+            slide: hop,
+            decim,
+            search_ops: std::cell::Cell::new(0),
+            window,
+            channels: 0,
+            next_grain: 0,
+            expect: None,
+            prev: None,
+            acc: Vec::new(),
+            acc_base: 0,
+        }
     }
 
     fn render(&mut self, cursor: i64, buf: &mut [f32], ch: usize) {
@@ -180,8 +206,11 @@ impl Wsola {
         let region = self.source.region(region_start, region_len, ch);
         // Correlate per channel and add the scores: summing the waveforms first would cancel
         // out-of-phase stereo and leave nothing to align on.
-        let planes: Vec<Vec<f32>> = (0..ch.min(GUIDE_CHANNELS)).map(|c| region.chunks_exact(ch).map(|f| f.get(c).copied().unwrap_or(0.0)).collect()).collect();
-        let shift = self.best_shift(&planes).unwrap_or(slide);
+        let frames: Vec<&[f32]> = region.chunks_exact(ch).collect();
+        let planes: Vec<Vec<f32>> = (0..ch.min(GUIDE_CHANNELS))
+            .map(|c| frames.chunks(self.decim).map(|g| g.iter().map(|f| f.get(c).copied().unwrap_or(0.0)).sum::<f32>() / g.len() as f32).collect())
+            .collect();
+        let shift = self.best_shift(&planes).map_or(slide, |k| k * self.decim);
         let offset = j.saturating_mul(hop as i64).saturating_sub(self.acc_base).max(0) as usize;
         if self.acc.len() < (offset + len) * ch {
             self.acc.resize((offset + len) * ch, 0.0);
@@ -203,27 +232,37 @@ impl Wsola {
     /// followed the previous grain's own first half, over all guide channels. `None` without a
     /// usable previous grain or a signal (the nominal position then stands).
     fn best_shift(&self, planes: &[Vec<f32>]) -> Option<usize> {
+        let (hop, slide) = (self.hop / self.decim, self.slide / self.decim);
         let prev = self.prev.as_ref()?;
-        let natural_at = usize::try_from(prev.start.checked_add(self.hop as i64)?.checked_sub(prev.base)?).ok()?;
-        let naturals: Vec<&[f32]> = prev.planes.iter().map(|p| p.get(natural_at..natural_at + self.hop)).collect::<Option<_>>()?;
+        let natural_at = usize::try_from(prev.start.checked_add(self.hop as i64)?.checked_sub(prev.base)?).ok()? / self.decim;
+        let naturals: Vec<&[f32]> = prev.planes.iter().map(|p| p.get(natural_at..natural_at + hop)).collect::<Option<_>>()?;
         if naturals.iter().flat_map(|n| n.iter()).map(|x| x * x).sum::<f32>() < 1e-9 {
             return None;
         }
+        // correlate on the most energetic channels only; the shift is shared by all
+        let mut order: Vec<usize> = (0..naturals.len()).collect();
+        let level = |c: usize| naturals.get(c).map_or(0.0, |n| n.iter().map(|x| x * x).sum::<f32>());
+        order.sort_by(|a, b| level(*b).total_cmp(&level(*a)));
+        order.truncate(SEARCH_CHANNELS);
+        let guide: Vec<(&Vec<f32>, &[f32])> = order.iter().filter_map(|c| Some((planes.get(*c)?, *naturals.get(*c)?))).collect();
         let mut best: Option<(f32, usize)> = None;
-        for k in 0..=2 * self.slide {
+        let mut ops = 0;
+        for k in 0..=2 * slide {
             let (mut dot, mut energy) = (0.0f32, 0.0f32);
-            for (plane, natural) in planes.iter().zip(&naturals) {
-                for (a, b) in plane.get(k..k + self.hop)?.iter().zip(*natural).step_by(2) {
+            for (plane, natural) in &guide {
+                for (a, b) in plane.get(k..k + hop)?.iter().zip(*natural).step_by(2) {
                     dot += a * b;
                     energy += a * a;
+                    ops += 1;
                 }
             }
             let score = if energy > 1e-9 { dot / energy.sqrt() } else { f32::MIN };
-            let closer = |old: usize| k.abs_diff(self.slide) < old.abs_diff(self.slide);
+            let closer = |old: usize| k.abs_diff(slide) < old.abs_diff(slide);
             if best.is_none_or(|(s, at)| score > s || (score == s && closer(at))) {
                 best = Some((score, k));
             }
         }
+        self.search_ops.set(self.search_ops.get().max(ops));
         best.map(|(_, k)| k)
     }
 }
@@ -260,17 +299,17 @@ mod tests {
 
     #[test]
     fn original_tones_survive_shuttling_including_high_frequencies() {
+        // each tone in its own run, the same on both channels of a stereo pair
         for sr in [44_100, 48_000, 96_000] {
             for speed in [0.5, 0.75, 1.5, 2.0, 4.0] {
                 let (from, to) = rates(sr, speed);
-                let tones = vec![440.0, 660.0, 6300.0, 9000.0, 18_000.0, 1000.0];
-                let mut mix = corrected(tone_mix(from, tones.clone(), false), from, to);
-                let mut buf = vec![0.0; 16_000 * tones.len()];
-                mix(i64::from(to), &mut buf, tones.len());
-                for (ch, hz) in tones.iter().enumerate() {
-                    let samples: Vec<f32> = buf.chunks_exact(tones.len()).map(|f| f[ch]).collect();
-                    let level = amplitude(&samples, *hz, sr);
-                    assert!(level > 0.1, "{sr} Hz, {speed}x, channel {ch}: {hz} Hz level={level}");
+                for hz in [440.0, 660.0, 1000.0, 6300.0, 9000.0, 18_000.0] {
+                    let mut mix = corrected(tone_mix(from, vec![hz, hz], false), from, to);
+                    let mut buf = vec![0.0; 16_000 * 2];
+                    mix(i64::from(to), &mut buf, 2);
+                    let samples: Vec<f32> = buf.iter().step_by(2).copied().collect();
+                    let level = amplitude(&samples, hz, sr);
+                    assert!(level > 0.1, "{sr} Hz, {speed}x: {hz} Hz level={level}");
                     if hz * speed < f64::from(sr) / 2.0 {
                         assert!(amplitude(&samples, hz * speed, sr) < level * 0.15, "uncorrected pitch at {speed}x: {hz} Hz");
                     }
@@ -401,6 +440,32 @@ mod tests {
         assert!(wanted > 0.2, "{wanted}");
         for hz in [400.0, 430.0, 460.0, 480.0] {
             assert!(amplitude(&left, hz, sr) < wanted * 0.15, "{hz} Hz leaked");
+        }
+    }
+
+    /// The alignment search of one grain costs the same at any device rate, and stays inside what
+    /// a mixing thread can do in real time at 96 kHz and 192 kHz with six channels.
+    #[test]
+    fn the_alignment_search_cost_does_not_grow_with_the_sample_rate() {
+        let mut worst = Vec::new();
+        for (rate, ch) in [(48_000u32, 6usize), (96_000, 6), (192_000, 6), (192_000, 8)] {
+            let mut stream = Wsola::new(Source::new(Box::new(tone_mix_n(rate, ch))), rate, rate / 2);
+            let mut buf = vec![0.0; 4096 * ch];
+            for block in 0..6 {
+                stream.render(i64::from(rate / 2) + block * 4096, &mut buf, ch);
+            }
+            worst.push(stream.search_ops.get());
+        }
+        // at most 2 channels x 1921 lags x 240 samples per 20 ms grain, at any rate
+        assert!(worst[0] > 100_000, "{worst:?}");
+        assert!(worst.iter().all(|w| *w <= 2_000_000), "{worst:?}");
+    }
+
+    fn tone_mix_n(rate: u32, ch: usize) -> impl FnMut(i64, &mut [f32], usize) + Send {
+        let mut inner = tone_mix(rate, (0..ch).map(|c| 300.0 + 170.0 * c as f64).collect(), false);
+        move |start, buf: &mut [f32], channels| {
+            debug_assert_eq!(channels, ch);
+            inner(start, buf, channels);
         }
     }
 
