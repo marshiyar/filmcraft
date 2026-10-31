@@ -498,3 +498,34 @@ fn subfolder_name_is_the_category_of_a_user_template() {
 fn filmcraft_engine_user_dir(s: &Session) -> std::path::PathBuf {
     crate::graphic_templates::user_templates_dir(s).unwrap()
 }
+
+/// Portrait templates (taller than wide) are also listed under "Vertical" (#3658).
+#[test]
+fn portrait_templates_are_in_the_vertical_category() {
+    let mut s = demo("gt-vertical");
+    let dir = filmcraft_engine_user_dir(&s);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (id, canvas) in [("portrait", [1080, 1920]), ("landscape", [1920, 1080]), ("square", [1080, 1080])] {
+        let mut t = crate::graphic_templates::builtin_templates().remove(0);
+        t.id = id.into();
+        t.name = id.into();
+        t.category = "Social".into();
+        t.canvas = canvas;
+        std::fs::write(dir.join(format!("{id}.fcgt")), t.to_json()).unwrap();
+    }
+    let ids = |v: Value| -> Vec<String> { v.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap().to_string()).collect() };
+    assert_eq!(ids(s.execute("graphics.template.list", json!({"category": "Vertical"})).unwrap()), ["portrait"]);
+    let social = ids(s.execute("graphics.template.list", json!({"category": "Social"})).unwrap());
+    assert_eq!(social.len(), 3, "a portrait template keeps its own category: {social:?}");
+    let t = crate::graphic_templates::library(&s).into_iter().find(|e| e.template.id == "portrait").unwrap().template;
+    assert_eq!(crate::graphic_templates::template_categories(&t), ["Social", "Vertical"]);
+    let l = crate::graphic_templates::library(&s).into_iter().find(|e| e.template.id == "landscape").unwrap().template;
+    assert_eq!(crate::graphic_templates::template_categories(&l), ["Social"]);
+    // a case-variant own category still gets the canonical Vertical entry
+    let mut odd = t.clone();
+    odd.category = "vertical".into();
+    assert_eq!(crate::graphic_templates::template_categories(&odd), ["vertical", "Vertical"]);
+    let mut exact = t;
+    exact.category = "Vertical".into();
+    assert_eq!(crate::graphic_templates::template_categories(&exact), ["Vertical"]);
+}

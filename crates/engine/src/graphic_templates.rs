@@ -83,6 +83,19 @@ pub fn library(s: &Session) -> Vec<LibraryEntry> {
     v
 }
 
+/// The categories a template is listed under: its own, and "Vertical" when its canvas is taller
+/// than wide (#3658).
+pub fn template_categories(t: &GraphicsTemplate) -> Vec<String> {
+    let mut v = vec![t.category.clone()];
+    if t.canvas[1] > t.canvas[0] && t.category != VERTICAL_CATEGORY {
+        v.push(VERTICAL_CATEGORY.to_string());
+    }
+    v
+}
+
+/// The Browse category of portrait templates.
+pub const VERTICAL_CATEGORY: &str = "Vertical";
+
 /// The category a template exported without one gets.
 const DEFAULT_TEMPLATE_CATEGORY: &str = "My Templates";
 
@@ -247,10 +260,10 @@ fn list_templates(s: &mut Session, p: &Value) -> Result<Value> {
             let t = &e.template;
             (q.is_empty()
                 || t.name.to_ascii_lowercase().contains(&q)
-                || t.category.to_ascii_lowercase().contains(&q)
+                || template_categories(t).iter().any(|c| c.to_ascii_lowercase().contains(&q))
                 || t.description.to_ascii_lowercase().contains(&q)
                 || t.tags.iter().any(|x| x.to_ascii_lowercase().contains(&q)))
-                && cat.as_ref().is_none_or(|c| t.category.to_ascii_lowercase() == *c)
+                && cat.as_ref().is_none_or(|c| template_categories(t).iter().any(|x| x.to_ascii_lowercase() == *c))
                 && src.is_none_or(|x| (x == "user") == e.path.is_some())
         })
         .map(entry_json)
