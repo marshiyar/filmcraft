@@ -122,12 +122,16 @@ impl Global {
 pub struct BridgeAddr(pub String);
 
 /// `PORT` alone is the app on this machine: `127.0.0.1:PORT`.
-fn parse_bridge(s: &str) -> Result<BridgeAddr, filmcraft_automation::AutomationError> {
+fn parse_bridge(s: &str) -> Result<BridgeAddr, BridgeError> {
     let addr = match s.parse::<u16>() {
         Ok(port) => format!("127.0.0.1:{port}"),
         Err(_) => s.to_string(),
     };
-    BridgeClient::new(addr.as_str()).map(|_| BridgeAddr(addr))
+    // port 0 asks the system for any port: there is no app to reach there
+    if addr.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>() == Ok(0)) {
+        return Err(BridgeError::PortZero);
+    }
+    BridgeClient::new(addr.as_str()).map(|_| BridgeAddr(addr)).map_err(BridgeError::Client)
 }
 
 #[derive(Subcommand, Debug)]
@@ -395,6 +399,15 @@ pub struct BenchDecodeArgs {
     pub frames: i64,
 }
 
+/// Why a `--bridge` address is refused.
+#[derive(Debug, Error)]
+pub enum BridgeError {
+    #[error("port 0 is not an address to connect to")]
+    PortZero,
+    #[error(transparent)]
+    Client(filmcraft_automation::AutomationError),
+}
+
 #[derive(Debug, Error)]
 pub enum ValueError {
     #[error("a value is required")]
@@ -542,6 +555,11 @@ mod tests {
         assert_eq!(c.global.bridge.map(|b| b.0).as_deref(), Some("127.0.0.1:9876"));
         assert!(parse("--bridge 0.0.0.0:9876 exec x").is_err(), "not a loopback address");
         assert!(parse("--bridge 70000 exec x").is_err());
+        for zero in ["0", "127.0.0.1:0", "00"] {
+            let e = parse(&format!("--bridge {zero} exec x")).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{zero}");
+            assert!(e.to_string().contains("port 0"), "{zero}: {e}");
+        }
     }
 
     #[test]
