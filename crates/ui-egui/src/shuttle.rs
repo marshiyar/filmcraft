@@ -9,12 +9,14 @@ use filmcraft_project::ItemId;
 
 type Mixer = Box<dyn FnMut(i64, &mut [f32], usize) + Send>;
 const MAX_CHANNELS: usize = 64;
+/// Above this device rate (no real device) the pitch is not kept: plain resampling.
+const MAX_DEVICE_RATE: u32 = 768_000;
 /// Source positions stay this far inside the `i64` range, so grain arithmetic cannot overflow.
 const FRAME_MARGIN: i128 = 1 << 20;
 
 pub(crate) fn mix(session: &Session, seq_id: ItemId, device_rate: u32, speed: f64) -> Option<(u32, Mixer)> {
     let rate = super::shuttle_mix_rate(device_rate, speed)?;
-    if !session.prefs.audio.maintain_pitch_shuttling || rate == device_rate {
+    if !session.prefs.audio.maintain_pitch_shuttling || rate == device_rate || device_rate > MAX_DEVICE_RATE {
         return Some((rate, Box::new(super::playback_mix(session, seq_id, rate))));
     }
     Some((rate, Box::new(corrected(super::playback_mix(session, seq_id, device_rate), device_rate, rate))))
@@ -58,18 +60,21 @@ struct Source {
     mix: Mixer,
     /// Interleaved frames from source frame `base` to `end`.
     buf: Vec<f32>,
+    channels: usize,
     base: i64,
     end: i64,
 }
 
 impl Source {
     fn new(mix: Mixer) -> Self {
-        Source { mix, buf: Vec::new(), base: 0, end: 0 }
+        Source { mix, buf: Vec::new(), channels: 0, base: 0, end: 0 }
     }
 
     /// `len` interleaved frames from source frame `start`; silence where the mixer gives none.
     fn region(&mut self, start: i64, len: usize, ch: usize) -> Vec<f32> {
-        if start < self.base || start > self.end.saturating_add(JUMP) || !self.buf.len().is_multiple_of(ch) {
+        if start < self.base || start > self.end.saturating_add(JUMP) || self.channels != ch {
+            // (also when the channel count changed: the kept frames have another stride)
+            self.channels = ch;
             self.base = start;
             self.end = start;
             self.buf.clear();
@@ -146,6 +151,8 @@ impl Wsola {
         // the alignment search runs on the signal averaged down to at most 48 kHz, so its cost
         // does not grow with the device rate; grain and slide are whole multiples of that factor
         let decim = (from as usize).div_ceil(48_000).max(1);
+        // at least one averaged sample per half grain, at any rate
+        let len = len.max(2 * decim);
         let len = len - len % (2 * decim);
         let hop = len / 2;
         let window = (0..len).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / len as f32).cos()).collect();
@@ -179,7 +186,7 @@ impl Wsola {
             self.acc.clear();
             self.prev = None;
         }
-        let end = cursor + n as i64;
+        let end = cursor.saturating_add(n as i64);
         let last = (end - 1).div_euclid(hop);
         while self.next_grain <= last {
             self.add_grain(self.next_grain);
@@ -247,10 +254,11 @@ impl Wsola {
         let guide: Vec<(&Vec<f32>, &[f32])> = order.iter().filter_map(|c| Some((planes.get(*c)?, *naturals.get(*c)?))).collect();
         let mut best: Option<(f32, usize)> = None;
         let mut ops = 0;
-        for k in 0..=2 * slide {
+        'lags: for k in 0..=2 * slide {
             let (mut dot, mut energy) = (0.0f32, 0.0f32);
             for (plane, natural) in &guide {
-                for (a, b) in plane.get(k..k + hop)?.iter().zip(*natural).step_by(2) {
+                let Some(candidate) = plane.get(k..k + hop) else { continue 'lags };
+                for (a, b) in candidate.iter().zip(*natural).step_by(2) {
                     dot += a * b;
                     energy += a * a;
                     ops += 1;
@@ -467,6 +475,62 @@ mod tests {
             debug_assert_eq!(channels, ch);
             inner(start, buf, channels);
         }
+    }
+
+    /// An absurd device rate must not give an empty grain (which divided by zero).
+    #[test]
+    fn an_absurd_sample_rate_still_has_a_grain() {
+        for rate in [1u32, 8_000, 768_000, 200_000_000, u32::MAX] {
+            let mut stream = Wsola::new(Source::new(Box::new(tone_mix_n(48_000, 1))), rate, (rate / 2).max(1));
+            assert!(stream.len >= 2 && stream.hop >= 1 && stream.len.is_multiple_of(2), "{rate}: len {} hop {}", stream.len, stream.hop);
+            let mut buf = vec![0.0; 64];
+            stream.render(0, &mut buf, 1);
+            assert!(buf.iter().all(|x| x.is_finite()), "{rate}");
+        }
+    }
+
+    /// Frames kept from a stereo stream must not be read with a mono stride after the device
+    /// changes its channel count.
+    #[test]
+    fn a_change_of_channel_count_starts_the_source_afresh() {
+        let (from, to) = rates(48_000, 2.0);
+        let two_channels = |start: i64, buf: &mut [f32], ch: usize| {
+            // channel 0 is a 440 Hz tone, channel 1 a 660 Hz one; mono is the first only
+            for (i, frame) in buf.chunks_exact_mut(ch).enumerate() {
+                let t = (start + i as i64) as f64 / 48_000.0;
+                for (c, x) in frame.iter_mut().enumerate() {
+                    *x = (0.3 * (std::f64::consts::TAU * (440.0 + 220.0 * c as f64) * t).sin()) as f32;
+                }
+            }
+        };
+        let mut switched = corrected(two_channels, from, to);
+        let mut stereo = vec![0.0; 4096 * 2];
+        switched(i64::from(to), &mut stereo, 2);
+        let mut mono_after = vec![0.0; 4096];
+        switched(i64::from(to) + 4096, &mut mono_after, 1);
+        let mut fresh = corrected(two_channels, from, to);
+        let mut mono_fresh = vec![0.0; 4096];
+        fresh(i64::from(to) + 4096, &mut mono_fresh, 1);
+        assert!(mono_fresh.iter().any(|x| x.abs() > 0.1), "the reference is silent");
+        assert_eq!(mono_after, mono_fresh);
+    }
+
+    /// The source's kept frames have the stride of the channel count they were read with.
+    #[test]
+    fn the_source_drops_its_frames_when_the_channel_count_changes() {
+        let frame_value = |start: i64, buf: &mut [f32], ch: usize| {
+            for (i, frame) in buf.chunks_exact_mut(ch).enumerate() {
+                for (c, x) in frame.iter_mut().enumerate() {
+                    *x = (start + i as i64) as f32 + 0.5 * c as f32;
+                }
+            }
+        };
+        let mut source = Source::new(Box::new(frame_value));
+        source.region(0, 3 * READ_BLOCK, 2);
+        // continuing inside what was read, now with one channel
+        let mono = source.region(READ_BLOCK as i64, 100, 1);
+        let want: Vec<f32> = (0..100).map(|i| (READ_BLOCK + i) as f32).collect();
+        assert_eq!(mono, want);
     }
 
     /// The mixer keeps effect state between calls that continue where the last one ended, so
