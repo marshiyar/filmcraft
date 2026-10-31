@@ -1375,6 +1375,8 @@ struct ProbeEnv {
     fetches: std::sync::atomic::AtomicUsize,
     before: Box<dyn Fn(usize) + Send + Sync>,
     shifted: Option<Box<dyn Fn(usize) -> bool + Send + Sync>>,
+    /// Given the frame's index: draw it at three quarters of the size asked for (it may wait first).
+    narrow: Option<Box<dyn Fn(usize) -> bool + Send + Sync>>,
 }
 impl FxEnv for ProbeEnv {
     fn frame(&self, dt: f64, upto: &EffectInstance) -> Option<Image> {
@@ -1385,6 +1387,8 @@ impl FxEnv for ProbeEnv {
         (self.before)(n);
         let shifted = self.shifted.as_ref().is_some_and(|f| f(n));
         let t = ((self.clip.now + dt) * self.clip.fps).round() / self.clip.fps + if shifted { 3.0 / self.clip.fps } else { 0.0 };
+        let k = (dt * self.clip.fps).round().max(0.0) as usize;
+        let scale = if self.narrow.as_ref().is_some_and(|f| f(k)) { scale * 0.75 } else { scale };
         Some(self.clip.render(t, scale))
     }
     fn track(&self, index: usize) -> Option<Image> {
@@ -1440,6 +1444,7 @@ fn stabilizer_analysis_is_not_repeated_for_a_skip_in_another_analysis() {
                     clip: ClipEnv { key: 0xBEEF_1000 ^ 0x1_0000, secs: 0.5, ..clip(0) },
                     fetches: Default::default(),
                     shifted: None,
+                    narrow: None,
                     // only the first fetch waits, so the pool's workers are not all held by one analysis
                     before: Box::new(move |n| {
                         if n == 0 {
@@ -1460,6 +1465,7 @@ fn stabilizer_analysis_is_not_repeated_for_a_skip_in_another_analysis() {
                     clip: clip(0xCAFE_0000),
                     fetches: Default::default(),
                     shifted: None,
+                    narrow: None,
                     before: Box::new(move |n| {
                         if n == 0 {
                             wait_for(&skipped)
@@ -1524,6 +1530,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
                     clip: clip(base ^ 0x1EAF),
                     fetches: Default::default(),
                     shifted: None,
+                    narrow: None,
                     before: Box::new(move |n| {
                         if n == 0 {
                             held.open();
@@ -1541,6 +1548,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
             fetches: Default::default(),
             before: Box::new(|_| {}),
             shifted: Some(Box::new(move |_| stabilizer_path(&clip(base ^ 0x1EAF), 0.0, method, false).is_none())),
+            narrow: None,
         };
         let outer = {
             let release = release.clone();
@@ -1553,6 +1561,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
                     }
                 }),
                 shifted: Some(Box::new(move |n| stabilizer_path(&middle(n), 0.0, method, false).is_none())),
+                narrow: None,
             }
         };
         let first = stabilizer_path(&outer, 0.0, method, false).map(|p| p.steps.clone());
@@ -1566,6 +1575,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
                 clip: clip(base ^ 0x0A7E),
                 fetches: Default::default(),
                 shifted: None,
+                narrow: None,
                 before: Box::new(move |n| drop(stabilizer_path(&middle(n), 0.0, method, false))),
             };
             stabilizer_path(&outer, 0.0, method, false).map(|p| p.steps.clone())
@@ -1632,15 +1642,40 @@ fn stabilizer_analysis_hands_its_cancellation_to_the_nested_clips_it_fetches() {
                         counted.fetch_add(1, SeqCst);
                     }),
                     shifted: None,
+                    narrow: None,
                 };
                 let _ = stabilizer_path(&nested, 0.0, method, false);
             }),
             shifted: None,
+            narrow: None,
         }
     };
     let path = filmcraft_media::cancel::with_cancel(&flag, || stabilizer_path(&outer, 0.0, method, false));
     assert!(path.is_none(), "a cancelled analysis has no path");
     assert_eq!(nested_fetches.load(SeqCst), 0, "the nested clip was analysed for a cancelled request");
+}
+
+#[test]
+fn stabilizer_analysis_takes_its_size_from_the_first_frame_whichever_fetch_ends_first() {
+    // an image sequence of mixed sizes: the first frame is slow, so later (narrower) frames end
+    // first; the path is still in the first frame's size, every time
+    let method = filmcraft_project::TrackMethod::Position;
+    for run in 0..4u64 {
+        let env = ProbeEnv {
+            clip: ClipEnv { w: 96, h: 72, fps: 24.0, secs: 0.25, now: 0.0, key: 0x4000_0000 + run, seq: (96, 72), pic: shaky },
+            fetches: Default::default(),
+            before: Box::new(|_| {}),
+            shifted: None,
+            narrow: Some(Box::new(|k| {
+                if k == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                k != 0
+            })),
+        };
+        let path = stabilizer_path(&env, 0.0, method, false).expect("a path");
+        assert_eq!((path.w, path.h), (96, 72), "run {run}: the path took the size of a later frame");
+    }
 }
 
 #[test]

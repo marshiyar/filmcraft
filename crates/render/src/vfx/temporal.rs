@@ -414,14 +414,19 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     // the pool's workers don't carry this thread's cancellation flag; hand it to them
     let hints = filmcraft_media::cancel::Context::current();
     let cancelled = || hints.clone().run(filmcraft_media::cancel::cancelled);
-    // every frame has the size of the first one that exists
-    let dims: OnceLock<(usize, usize)> = OnceLock::new();
+    // every frame has the size of the first one that exists: the fetches end in any order, so the
+    // earliest index wins, not the first to finish
+    let dims: Mutex<Option<(usize, (usize, usize))>> = Mutex::new(None);
     let skips = Arc::new(AtomicUsize::new(0));
     let fetch = |k: usize| {
         // the frame is fetched on a pool worker: the request's flag covers what it analyses too
         let frame = hints.clone().run(|| counting_skips(&skips, || env.source_frame(k as f64 / fps - now, scale)));
         let p = frame.map(|f| Prepared::new(gray_of(&f)))?;
-        let _ = dims.set((p.base().w, p.base().h));
+        let mut first = dims.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first.is_none_or(|(at, _)| k < at) {
+            *first = Some((k, (p.base().w, p.base().h)));
+        }
+        drop(first);
         Some(p)
     };
     let track = |a: &Prepared, b: &Prepared| {
@@ -448,7 +453,7 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
         note_skip();
         return None;
     };
-    let (w, h) = dims.get().copied()?;
+    let (w, h) = dims.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).map(|(_, size)| size)?;
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {
         if c.len() > 64 {
