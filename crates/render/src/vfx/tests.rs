@@ -1484,7 +1484,8 @@ fn stabilizer_analysis_of_a_nest_in_a_nest_is_not_kept_mixed() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let method = filmcraft_project::TrackMethod::Position;
-        let clip = |key| ClipEnv { w: 96, h: 72, fps: 24.0, secs: 1.0, now: 0.0, key, seq: (96, 72), pic: shaky };
+        // short nests: the leaf's hold must outlast the whole run, which is what wait_for's bound limits
+        let clip = |key| ClipEnv { w: 96, h: 72, fps: 24.0, secs: 0.25, now: 0.0, key, seq: (96, 72), pic: shaky };
         let (held, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let holder = {
             let (held, release) = (held.clone(), release.clone());
@@ -1495,7 +1496,7 @@ fn stabilizer_analysis_of_a_nest_in_a_nest_is_not_kept_mixed() {
                     before: Box::new(move |n| {
                         if n == 0 {
                             held.store(true, SeqCst);
-                            wait_for(&release);
+                            wait_for_up_to(&release, 300);
                         }
                     }),
                 };
@@ -1527,8 +1528,12 @@ fn stabilizer_analysis_of_a_nest_in_a_nest_is_not_kept_mixed() {
 }
 
 fn wait_for(flag: &Arc<std::sync::atomic::AtomicBool>) {
+    wait_for_up_to(flag, 20);
+}
+
+fn wait_for_up_to(flag: &Arc<std::sync::atomic::AtomicBool>, secs: u64) {
     let start = std::time::Instant::now();
-    while !flag.load(std::sync::atomic::Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(20) {
+    while !flag.load(std::sync::atomic::Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(secs) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
