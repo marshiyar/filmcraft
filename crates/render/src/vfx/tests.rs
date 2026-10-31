@@ -1377,6 +1377,8 @@ struct ProbeEnv {
     shifted: Option<Box<dyn Fn(usize) -> bool + Send + Sync>>,
     /// Given the frame's index: draw it at three quarters of the size asked for (it may wait first).
     narrow: Option<Box<dyn Fn(usize) -> bool + Send + Sync>>,
+    /// Every frame is unavailable (the source fails to deliver it).
+    gone: bool,
 }
 impl FxEnv for ProbeEnv {
     fn frame(&self, dt: f64, upto: &EffectInstance) -> Option<Image> {
@@ -1385,6 +1387,9 @@ impl FxEnv for ProbeEnv {
     fn source_frame(&self, dt: f64, scale: f32) -> Option<Image> {
         let n = self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (self.before)(n);
+        if self.gone {
+            return None;
+        }
         let shifted = self.shifted.as_ref().is_some_and(|f| f(n));
         let t = ((self.clip.now + dt) * self.clip.fps).round() / self.clip.fps + if shifted { 3.0 / self.clip.fps } else { 0.0 };
         let k = (dt * self.clip.fps).round().max(0.0) as usize;
@@ -1452,6 +1457,7 @@ fn stabilizer_analysis_is_not_repeated_for_a_skip_in_another_analysis() {
                     fetches: Default::default(),
                     shifted: None,
                     narrow: None,
+                    gone: false,
                     before: Box::new(move |n| {
                         if n == 0 {
                             wait_for(&skipped)
@@ -1498,6 +1504,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
             before: Box::new(|_| {}),
             shifted: Some(Box::new(move |_| stabilizer_path(&clip(base ^ 0x1EAF), 0.0, method, false).is_none())),
             narrow: None,
+            gone: false,
         };
         let outer = {
             let claim = claim.clone();
@@ -1511,6 +1518,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
                 }),
                 shifted: Some(Box::new(move |n| stabilizer_path(&middle(n), 0.0, method, false).is_none())),
                 narrow: None,
+                gone: false,
             }
         };
         let first = stabilizer_path(&outer, 0.0, method, false).map(|p| p.steps.clone());
@@ -1524,6 +1532,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
                 fetches: Default::default(),
                 shifted: None,
                 narrow: None,
+                gone: false,
                 before: Box::new(move |n| drop(stabilizer_path(&middle(n), 0.0, method, false))),
             };
             stabilizer_path(&outer, 0.0, method, false).map(|p| p.steps.clone())
@@ -1591,11 +1600,13 @@ fn stabilizer_analysis_hands_its_cancellation_to_the_nested_clips_it_fetches() {
                     }),
                     shifted: None,
                     narrow: None,
+                    gone: false,
                 };
                 let _ = stabilizer_path(&nested, 0.0, method, false);
             }),
             shifted: None,
             narrow: None,
+            gone: false,
         }
     };
     let path = filmcraft_media::cancel::with_cancel(&flag, || stabilizer_path(&outer, 0.0, method, false));
@@ -1620,10 +1631,37 @@ fn stabilizer_analysis_takes_its_size_from_the_first_frame_whichever_fetch_ends_
                 }
                 k != 0
             })),
+            gone: false,
         };
         let path = stabilizer_path(&env, 0.0, method, false).expect("a path");
         assert_eq!((path.w, path.h), (96, 72), "run {run}: the path took the size of a later frame");
     }
+}
+
+#[test]
+fn stabilizer_analysis_that_gives_up_on_a_nested_clip_is_not_kept() {
+    // every other middle nest fails to deliver any frame of its own, so its analysis ends without a
+    // path; the outer drew those nests unstabilised, so the path it measured is mixed, whatever the
+    // way the middle's analysis ended
+    let method = filmcraft_project::TrackMethod::Position;
+    let clip = |key| ClipEnv { w: 96, h: 72, fps: 24.0, secs: 0.25, now: 0.0, key, seq: (96, 72), pic: shaky };
+    let middle = move |n: usize| ProbeEnv {
+        clip: clip(0x5000_0000 + n as u64),
+        fetches: Default::default(),
+        before: Box::new(|_| {}),
+        shifted: None,
+        narrow: None,
+        gone: n.is_multiple_of(2),
+    };
+    let outer = ProbeEnv {
+        clip: clip(0x5000_ffff),
+        fetches: Default::default(),
+        before: Box::new(|_| {}),
+        shifted: Some(Box::new(move |n| stabilizer_path(&middle(n), 0.0, method, false).is_none())),
+        narrow: None,
+        gone: false,
+    };
+    assert!(stabilizer_path(&outer, 0.0, method, false).is_none(), "a path measured partly on unstabilised nested frames was kept");
 }
 
 #[test]

@@ -453,7 +453,11 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     let mut steps = None;
     for _ in 0..ANALYSIS_ATTEMPTS {
         let skipped = skips.load(Ordering::SeqCst);
-        let run = run_analysis(analysis_pool(), cfg!(target_family = "wasm"), || chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track))?;
+        // no run (cancelled, no pool, a worker panicked): drawn unstabilised for whoever fetched this frame
+        let Some(run) = run_analysis(analysis_pool(), cfg!(target_family = "wasm"), || chunked_steps(n, ANALYSIS_CHUNK, &cancelled, &fetch, &track)) else {
+            note_skip();
+            return None;
+        };
         if skips.load(Ordering::SeqCst) == skipped {
             steps = Some(run);
             break;
@@ -464,7 +468,11 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
         note_skip();
         return None;
     };
-    let (w, h) = dims.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).map(|(_, size)| size)?;
+    // no frame existed: the nest that fetched this clip's frames drew it unstabilised
+    let Some((w, h)) = dims.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).map(|(_, size)| size) else {
+        note_skip();
+        return None;
+    };
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {
         if c.len() > 64 {
