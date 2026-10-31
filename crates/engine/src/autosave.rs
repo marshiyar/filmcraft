@@ -527,6 +527,14 @@ pub fn unix_now() -> i64 {
 /// How many following seconds [`publish_version`] tries when a name is taken.
 const NAME_TRIES: i64 = 64;
 
+/// The unix time in the name of a file `list_auto_saves` returned: `<name>-<YYYY-MM-DD_HH-MM-SS>[-<unix>]`.
+/// `None` for the older form without one. Only for such files: the 19-character stamp tells the forms apart.
+fn version_unix(path: &Path, name: &str) -> Option<i64> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix(&format!("{}-", names::file_stem(name)))?;
+    rest.get(20..)?.parse().ok()
+}
+
 /// Write `data` as a new version of `name` in `dir`, never replacing a file that is already there (#3621).
 /// A version's name has a one second resolution, so two writers of the same project name in the same
 /// second (the auto-save worker, and the snapshot taken before a project is replaced) would write the same
@@ -535,7 +543,8 @@ const NAME_TRIES: i64 = 64;
 /// a name that turns out to be taken (a concurrent writer) moves on to the next second. Returns the path.
 pub(crate) fn publish_version(dir: &Path, name: &str, now: i64, offset_at: &dyn Fn(i64) -> i32, data: &[u8]) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
-    let newest = names::list_auto_saves(dir, name).iter().filter_map(|p| p.file_stem()?.to_str()?.rsplit('-').next()?.parse::<i64>().ok()).max();
+    // `list_auto_saves` decides what is a version of this project and orders them; the newest is its last
+    let newest = names::list_auto_saves(dir, name).last().and_then(|p| version_unix(p, name));
     let no_time = || io::Error::new(io::ErrorKind::InvalidInput, "no newer auto-save time is available");
     let start = match newest {
         Some(n) => n.checked_add(1).ok_or_else(no_time)?.max(now),

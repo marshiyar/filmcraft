@@ -455,3 +455,15 @@ fn a_long_project_name_still_publishes() {
     let name = "é".repeat(100);
     autosave::publish_version(&dir, &name, 1_790_000_000, &|_| 0, b"x").expect("a long name fits the staging file too");
 }
+
+/// #3621: a file `list_auto_saves` does not count as a version (a sign in its time) must not move the
+/// next version's time, and a version without a unix time in its name is not read as one from its seconds.
+#[test]
+fn publish_version_orders_by_the_same_rule_as_the_version_list() {
+    let dir = temp_dir("publish-parse");
+    let now = 1_790_000_000;
+    std::fs::write(dir.join("P-2026-10-30_10-00-00-+9999999999.fcproj"), b"not a version").unwrap();
+    std::fs::write(dir.join("P-2026-10-30_10-00-59.fcproj"), b"old form").unwrap();
+    let path = autosave::publish_version(&dir, "P", now, &|_| 0, b"x").unwrap();
+    assert!(path.to_string_lossy().ends_with(&format!("-{now}.fcproj")), "{path:?}");
+}
