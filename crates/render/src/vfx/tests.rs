@@ -1431,32 +1431,18 @@ fn stabilizer_analysis_is_not_repeated_for_a_skip_in_another_analysis() {
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     // a nest skips a nested clip another request is analysing; an unrelated clip analysed at the
     // same time measured nothing of that and keeps its first run
+    // (the unrelated clip waits on a worker for the nest's skip, which needs another one)
+    if super::temporal::analysis_pool_threads() < 2 {
+        return;
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let method = filmcraft_project::TrackMethod::Position;
         let clip = |key| ClipEnv { w: 96, h: 72, fps: 24.0, secs: 1.0, now: 0.0, key, seq: (96, 72), pic: shaky };
-        let (held, release, skipped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        // the nest's first nested clip, analysed (slowly) by someone else
-        let holder = {
-            let (held, release) = (held.clone(), release.clone());
-            std::thread::spawn(move || {
-                let inner = ProbeEnv {
-                    clip: ClipEnv { key: 0xBEEF_1000 ^ 0x1_0000, secs: 0.5, ..clip(0) },
-                    fetches: Default::default(),
-                    shifted: None,
-                    narrow: None,
-                    // only the first fetch waits, so the pool's workers are not all held by one analysis
-                    before: Box::new(move |n| {
-                        if n == 0 {
-                            held.store(true, SeqCst);
-                            wait_for(&release);
-                        }
-                    }),
-                };
-                let _ = stabilizer_path(&inner, 0.0, method, false);
-            })
-        };
-        wait_for(&held);
+        // the nest's first nested clip, analysed (slowly) by someone else: its claim is held from
+        // this plain thread, not by an analysis occupying a pool worker
+        let held = super::temporal::Analysing::claim(super::temporal::path_key(0xBEEF_1000 ^ 0x1_0000, method, false));
+        let skipped = Arc::new(AtomicBool::new(false));
         // the unrelated clip waits for the nest's skip before it finishes its first frame
         let other = {
             let skipped = skipped.clone();
@@ -1481,8 +1467,8 @@ fn stabilizer_analysis_is_not_repeated_for_a_skip_in_another_analysis() {
             move || stabilizer_path(&NestEnv(clip(0xBEEF_1000), Some(skipped)), 0.0, method, false).is_some()
         });
         let other = other.join();
-        release.store(true, SeqCst);
-        let _ = (nest.join(), holder.join());
+        drop(held);
+        let _ = nest.join();
         let _ = tx.send(other.ok());
     });
     let (some, fetches) = rx.recv_timeout(std::time::Duration::from_secs(60)).expect("analyses finished").expect("analysis ran");
@@ -1490,58 +1476,21 @@ fn stabilizer_analysis_is_not_repeated_for_a_skip_in_another_analysis() {
     assert_eq!(fetches, 24, "the unrelated clip was analysed once, not repeated for another analysis' skip");
 }
 
-/// A one-shot gate: `wait` blocks until `open`, with no timeout of its own (the test's receiver
-/// is the only guard, so a slow run can't make a held analysis end early).
-#[derive(Default)]
-struct Gate(std::sync::Mutex<bool>, std::sync::Condvar);
-impl Gate {
-    fn open(&self) {
-        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        self.1.notify_all();
-    }
-    fn wait(&self) {
-        let mut open = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*open {
-            open = self.1.wait(open).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-}
-
-/// (`base` keys the clips apart from other tests' in the shared caches.)
-/// An outer nest of middle nests of one leaf clip that someone else is analysing. The leaf's
-/// analysis is held until the gate opens: after the whole run, or (`release_at`) when the outer's
-/// fetch of that frame comes (it can't wait for the leaf to finish: the worker would be stealing
-/// work on top of one of the leaf's own frames), so the leaf ends somewhere after it. Returns the outer's
-/// steps (None: its path was not kept) and, for `release_at`, the steps of the same outer analysed
-/// again with the leaf cached from the start.
+/// An outer nest of middle nests of one leaf clip that someone else is analysing (`base` keys the
+/// clips apart from other tests'). The leaf's claim is held until the run ends or, with
+/// `release_at`, until the outer's fetch of that frame, after which the middle nests analyse the
+/// leaf themselves. Returns the outer's steps (None: its path was not kept) and, for `release_at`,
+/// the steps of the same outer analysed again with the leaf cached from the start.
 fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>, Option<Vec<Affine>>) {
-    // one held analysis at a time: two could hold every worker of a small pool, with nobody left to open their gates
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let method = filmcraft_project::TrackMethod::Position;
         let clip = |key| ClipEnv { w: 96, h: 72, fps: 24.0, secs: 0.25, now: 0.0, key, seq: (96, 72), pic: shaky };
-        let (held, release) = (Arc::new(Gate::default()), Arc::new(Gate::default()));
-        let holder = {
-            let (held, release) = (held.clone(), release.clone());
-            std::thread::spawn(move || {
-                let leaf = ProbeEnv {
-                    clip: clip(base ^ 0x1EAF),
-                    fetches: Default::default(),
-                    shifted: None,
-                    narrow: None,
-                    before: Box::new(move |n| {
-                        if n == 0 {
-                            held.open();
-                            release.wait();
-                        }
-                    }),
-                };
-                let _ = stabilizer_path(&leaf, 0.0, method, false);
-            })
-        };
-        held.wait();
+        // The leaf is "being analysed elsewhere": its claim is held from this plain thread, so no
+        // pool worker is occupied (a one-worker pool could not run the outer then), and dropped
+        // with `claim` however this ends.
+        let leaf_key = super::temporal::path_key(base ^ 0x1EAF, method, false);
+        let claim = Arc::new(std::sync::Mutex::new(super::temporal::Analysing::claim(leaf_key)));
         // one middle nest per outer frame, so they don't claim each other's analyses
         let middle = move |n: usize| ProbeEnv {
             clip: clip(base ^ (0x31DD + n as u64)),
@@ -1551,13 +1500,13 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
             narrow: None,
         };
         let outer = {
-            let release = release.clone();
+            let claim = claim.clone();
             ProbeEnv {
                 clip: clip(base ^ 0x0A7E),
                 fetches: Default::default(),
                 before: Box::new(move |n| {
                     if release_at == Some(n) {
-                        release.open();
+                        claim.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
                     }
                 }),
                 shifted: Some(Box::new(move |n| stabilizer_path(&middle(n), 0.0, method, false).is_none())),
@@ -1565,8 +1514,7 @@ fn nest_in_a_nest(base: u64, release_at: Option<usize>) -> (Option<Vec<Affine>>,
             }
         };
         let first = stabilizer_path(&outer, 0.0, method, false).map(|p| p.steps.clone());
-        release.open();
-        let _ = holder.join();
+        claim.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         let warm = release_at.and_then(|_| {
             // the leaf is cached now: nothing is skipped
             super::temporal::clear_stabilizer_cache();
@@ -1594,7 +1542,7 @@ fn stabilizer_analysis_of_a_nest_in_a_nest_is_not_kept_mixed() {
 
 #[test]
 fn stabilizer_analysis_of_a_nest_is_not_kept_when_the_leaf_finishes_mid_way() {
-    // the leaf is released at the outer's seventh fetch, the first of its second run (a run is the
+    // the leaf's claim is released at the outer's seventh fetch, the first of its second run (a run is the
     // outer's six frames): the first run was drawn entirely on unstabilised middle nests and is
     // thrown away; what is kept (if anything) is a later run, measured with the leaf analysed
     let (first, warm) = nest_in_a_nest(0x2000_0000, Some(6));

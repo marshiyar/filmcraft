@@ -287,11 +287,11 @@ fn note_skip() {
 const ANALYSIS_ATTEMPTS: usize = 3;
 
 /// `key` marked as being analysed until this is dropped.
-struct Analysing(u64);
+pub(crate) struct Analysing(u64);
 
 impl Analysing {
     /// Marks `key` as being analysed, or None when it already is.
-    fn claim(key: u64) -> Option<Self> {
+    pub(crate) fn claim(key: u64) -> Option<Self> {
         let mut keys = ANALYSING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if keys.contains(&key) {
             return None;
@@ -312,6 +312,12 @@ impl Drop for Analysing {
 fn analysis_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().thread_name(|i| format!("stabilizer-{i}")).build().ok()).as_ref()
+}
+
+/// How many workers the analysis pool has (0: none can be built).
+#[cfg(test)]
+pub(crate) fn analysis_pool_threads() -> usize {
+    analysis_pool().map_or(0, rayon::ThreadPool::current_num_threads)
 }
 
 /// Run `job` on the analysis' own `pool`, entered from a plain thread: a worker of the pool that
@@ -376,9 +382,14 @@ pub(crate) fn chunked_steps<T: Send + Sync>(
     (!cancelled()).then_some(steps)
 }
 
+/// The key a clip's analysis is cached and claimed under.
+pub(crate) fn path_key(clip_key: u64, method: TrackMethod, detailed: bool) -> u64 {
+    clip_key ^ (method as u64).wrapping_mul(0x9E37) ^ (detailed as u64).wrapping_mul(0x51_7CC1)
+}
+
 /// Analyse (or fetch the cached analysis of) the clip `env` describes.
 pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
-    let key = env.clip_key() ^ (method as u64).wrapping_mul(0x9E37) ^ (detailed as u64).wrapping_mul(0x51_7CC1);
+    let key = path_key(env.clip_key(), method, detailed);
     let cached = || path_cache().lock().ok().and_then(|c| c.get(&key).cloned());
     if let Some(p) = cached() {
         return Some(p);
