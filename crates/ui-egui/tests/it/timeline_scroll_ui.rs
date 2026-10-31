@@ -443,7 +443,7 @@ fn a_sideways_trackpad_swipe_with_ctrl_held_scrolls_instead_of_dropping() {
 /// horizontal swipe with a little vertical drift scrolls sideways.
 #[test]
 fn a_mostly_horizontal_ctrl_swipe_scrolls_even_with_a_little_vertical_drift() {
-    for drift in [1.0, -3.0, 20.0] {
+    for drift in [1.0, -3.0, 20.0, 100.0, -100.0] {
         let mut d = Driver::tall();
         let tracks = d.rect("timeline.tracks");
         let over_tracks = egui::pos2(tracks[0] + tracks[2] * 0.5, tracks[1] + tracks[3] * 0.2);
@@ -458,6 +458,11 @@ fn a_mostly_horizontal_ctrl_swipe_scrolls_even_with_a_little_vertical_drift() {
         d.frames(3);
         let (scroll, pps, ..) = d.view();
         assert_eq!(pps, 50.0, "drift {drift}: no zoom");
-        assert!(scroll > 4.0, "drift {drift}: scrolled sideways, at {scroll}");
+        if drift.abs() == 100.0 {
+            // a tie is not a pinch either: the swipe scrolls (by its vertical part, as any tie does)
+            assert_ne!(scroll, 4.0, "drift {drift}: a tie scrolls");
+        } else {
+            assert!(scroll > 4.0, "drift {drift}: scrolled sideways, at {scroll}");
+        }
     }
 }

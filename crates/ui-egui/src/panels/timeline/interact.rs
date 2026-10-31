@@ -193,9 +193,9 @@ pub(crate) fn wheel_input(ctx: &egui::Context) -> WheelInput {
                         egui::MouseWheelSource::Unknown => matches!(unit, egui::MouseWheelUnit::Point),
                         _ => false,
                     };
-                    // only a mostly vertical gesture is a pinch; a swipe that is mostly sideways takes the
+                    // only a gesture that is more vertical than sideways is a pinch; a swipe that is mostly sideways takes the
                     // sideways-scroll path below, whatever vertical drift it has
-                    if modifiers.ctrl && !modifiers.mac_cmd && trackpad && delta.y.abs() >= delta.x.abs() {
+                    if modifiers.ctrl && !modifiers.mac_cmd && trackpad && delta.y.abs() > delta.x.abs() {
                         if delta.y.is_finite() {
                             w.pinch *= (delta.y * points / PINCH_POINTS).clamp(-1.0, 1.0).exp();
                         }
