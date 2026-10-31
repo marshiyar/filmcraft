@@ -5032,22 +5032,9 @@ fn snapshot_dirty(s: &Session) -> Result<Option<String>> {
     // barrier), and with a short version limit its rotation could remove the snapshot just written. So the
     // snapshot is checked after rotating and taken again when it is gone, a few times, before giving up.
     for _ in 0..4 {
-        // Names have a one second resolution and rotation drops the oldest: this version must sort after every
-        // retained one, or it could replace one taken in the same second or be rotated out at once.
-        let newest = filmcraft_format::autosave::list_auto_saves(&dir, &name)
-            .iter()
-            .filter_map(|p| p.file_stem()?.to_str()?.rsplit('-').next()?.parse::<i64>().ok())
-            .max();
-        let unix = match newest {
-            Some(n) => n
-                .checked_add(1)
-                .ok_or_else(|| EngineError::Other("could not snapshot the unsaved project: no newer auto-save time is available".into()))?
-                .max(now),
-            None => now,
-        };
-        let path = dir.join(filmcraft_format::autosave::auto_save_name(&name, unix, offset_at(unix)));
-        let write = std::fs::create_dir_all(&dir).and_then(|()| filmcraft_format::atomic_write(&path, &bytes));
-        write.map_err(|e| EngineError::Other(format!("could not snapshot the unsaved project before replacing it: {e}")))?;
+        // never replaces a version there, and sorts after every one (rotation drops the oldest)
+        let path = crate::autosave::publish_version(&dir, &name, now, &offset_at, &bytes)
+            .map_err(|e| EngineError::Other(format!("could not snapshot the unsaved project before replacing it: {e}")))?;
         // a version the auto-save list cannot find would not protect anything
         if !filmcraft_format::autosave::list_auto_saves(&dir, &name).contains(&path) {
             let _ = std::fs::remove_file(&path);

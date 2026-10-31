@@ -393,3 +393,21 @@ fn list_auto_saves_lists_only_auto_save_folders() {
     let snap = std::path::PathBuf::from(s.execute("file.newProject", json!({"name": "Next"})).unwrap()["snapshot"].as_str().unwrap());
     s.execute("file.listAutoSaves", json!({"name": "FilmCraft Demo", "dir": snap.parent().unwrap()})).unwrap();
 }
+
+/// Codex P1 on #3621: the snapshot and the auto-save worker name versions `<project>-<second>`; in the
+/// same second the later writer used to replace the other's only copy.
+#[test]
+fn a_snapshot_and_an_auto_save_in_the_same_second_both_survive() {
+    let (mut s, _d) = snapshot_session("snap-vs-worker");
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let replaced = (*s.project).clone();
+    // a project of the same name, so both write `FilmCraft Demo-<second>`
+    let snap = s.execute("file.newProject", json!({"name": "FilmCraft Demo"})).unwrap()["snapshot"].as_str().unwrap().to_string();
+    s.execute("file.newSequence", json!({"name": "S", "width": 1280, "height": 720, "fps": 24})).unwrap();
+    let worker = s.execute("file.autoSaveNow", json!({})).unwrap()["path"].as_str().expect("the worker wrote a version").to_string();
+    assert_ne!(snap, worker, "two writers, two files");
+    assert_eq!(filmcraft_format::decode(&std::fs::read(&snap).unwrap()).unwrap().project, replaced, "the snapshot keeps the replaced project");
+    assert_ne!(filmcraft_format::decode(&std::fs::read(&worker).unwrap()).unwrap().project, replaced);
+    assert_eq!(listed_auto_saves(&mut s, "FilmCraft Demo").len(), 2);
+}
