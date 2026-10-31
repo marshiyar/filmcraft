@@ -1539,6 +1539,44 @@ fn wait_for_up_to(flag: &Arc<std::sync::atomic::AtomicBool>, secs: u64) {
 }
 
 #[test]
+fn stabilizer_analysis_hands_its_cancellation_to_the_nested_clips_it_fetches() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    // the request is cancelled while the outer is analysed; the frame it is fetching analyses a
+    // nested clip on a pool worker, which has to see the request's flag and stop at once
+    let method = filmcraft_project::TrackMethod::Position;
+    let clip = |key| ClipEnv { w: 96, h: 72, fps: 24.0, secs: 1.0, now: 0.0, key, seq: (96, 72), pic: shaky };
+    let flag = Arc::new(AtomicBool::new(false));
+    let nested_fetches = Arc::new(AtomicUsize::new(0));
+    let outer = {
+        let (flag, nested_fetches) = (flag.clone(), nested_fetches.clone());
+        ProbeEnv {
+            clip: clip(0x3000_0001),
+            fetches: Default::default(),
+            before: Box::new(move |n| {
+                if n != 0 {
+                    return;
+                }
+                flag.store(true, SeqCst);
+                let counted = nested_fetches.clone();
+                let nested = ProbeEnv {
+                    clip: clip(0x3000_0002),
+                    fetches: Default::default(),
+                    before: Box::new(move |_| {
+                        counted.fetch_add(1, SeqCst);
+                    }),
+                    shifted: None,
+                };
+                let _ = stabilizer_path(&nested, 0.0, method, false);
+            }),
+            shifted: None,
+        }
+    };
+    let path = filmcraft_media::cancel::with_cancel(&flag, || stabilizer_path(&outer, 0.0, method, false));
+    assert!(path.is_none(), "a cancelled analysis has no path");
+    assert_eq!(nested_fetches.load(SeqCst), 0, "the nested clip was analysed for a cancelled request");
+}
+
+#[test]
 fn stabilizer_analysis_ignores_frames_of_another_size() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     let tracked = AtomicUsize::new(0);

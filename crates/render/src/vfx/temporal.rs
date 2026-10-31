@@ -418,7 +418,9 @@ pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed:
     let dims: OnceLock<(usize, usize)> = OnceLock::new();
     let skips = Arc::new(AtomicUsize::new(0));
     let fetch = |k: usize| {
-        let p = counting_skips(&skips, || env.source_frame(k as f64 / fps - now, scale)).map(|f| Prepared::new(gray_of(&f)))?;
+        // the frame is fetched on a pool worker: the request's flag covers what it analyses too
+        let frame = hints.clone().run(|| counting_skips(&skips, || env.source_frame(k as f64 / fps - now, scale)));
+        let p = frame.map(|f| Prepared::new(gray_of(&f)))?;
         let _ = dims.set((p.base().w, p.base().h));
         Some(p)
     };
