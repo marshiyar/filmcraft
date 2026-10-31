@@ -485,3 +485,14 @@ fn new_project_asks_before_discarding_changes_it_cannot_keep() {
     assert!(!d.app().session.is_dirty());
     assert_ne!(d.app().session.project.name, name, "Discard replaces the project");
 }
+
+/// The Demo Project replaces the project like New does, so it asks the same question (#3621 review).
+#[test]
+fn the_demo_project_asks_before_discarding_changes_it_cannot_keep() {
+    let mut d = Driver::new();
+    d.edit();
+    assert_eq!(d.menu("file.openDemoProject")["dialog"], "discardChanges");
+    assert!(d.app().session.is_dirty(), "nothing is discarded before the answer");
+    d.click("discardChanges.discard");
+    assert!(!d.app().session.is_dirty());
+}

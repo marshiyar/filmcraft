@@ -1335,7 +1335,8 @@ fn build() -> Vec<CommandSpec> {
             // the project as `project_inspect` names it (#1545: an agent needs no extra round trip)
             Ok(json!({"name": name, "revision": s.revision, "snapshot": snapshot}))
         }),
-        cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, "{}", always, |s, _| {
+        cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, r#"{"discard":bool?}"#, always, |s, p| {
+            let snapshot = snapshot_if_dirty(s, bool_p(p, "discard").unwrap_or(false))?;
             let (p, seq) = crate::demo::demo_project(&s.media);
             s.project = std::sync::Arc::new(p);
             s.document_epoch = s.document_epoch.wrapping_add(1);
@@ -1352,7 +1353,7 @@ fn build() -> Vec<CommandSpec> {
             s.saved_revision = s.revision;
             s.events.push(crate::Event::ProjectChanged { revision: s.revision });
             s.events.push(crate::Event::OpenSequence(seq));
-            Ok(json!({"sequence": seq.0}))
+            Ok(json!({"sequence": seq.0, "snapshot": snapshot}))
         }),
         cmd!(
             "file.newSequence",
@@ -1778,7 +1779,17 @@ fn build() -> Vec<CommandSpec> {
         }),
         query!("file.listAutoSaves", "Browse Auto-Saves", r#"{"name":str?,"dir":str?}"#, |s, p| {
             // `name` and `dir`: another project's versions (e.g. the one a New/Open just replaced, from its `snapshot` path)
-            let dir = str_p(p, "dir").map_or_else(|| auto_save_dir(s), std::path::PathBuf::from);
+            let dir = match str_p(p, "dir") {
+                None => auto_save_dir(s),
+                // only an auto-save location: the current project's, or where a replaced project's snapshot went
+                Some(d) => {
+                    let d = std::path::PathBuf::from(d);
+                    if d != auto_save_dir(s) && !s.snapshot_dirs.contains(&d) {
+                        return Err(bad("file.listAutoSaves", "`dir` must be an auto-save folder: the project's own, or the one a `snapshot` went to"));
+                    }
+                    d
+                }
+            };
             let name = str_p(p, "name").map_or_else(|| auto_save_name(s), str::to_string);
             let files = filmcraft_format::autosave::list_auto_saves(&dir, &name);
             Ok(json!({"dir": dir, "files": files.iter().rev().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>()}))
@@ -4909,7 +4920,7 @@ fn open_project(s: &mut Session, path: &str, discard: bool) -> Result<Value> {
     let snapshot = snapshot_if_dirty(s, discard)?;
     // the snapshot's rotation may have removed the very version being opened: then nothing backs it
     // and it stays unsaved
-    let backed = snapshot.is_none() || std::path::Path::new(path).exists();
+    let backed = snapshot.is_none() || s.services.file_size(path).is_ok();
     install_project(s, loaded.project, Some(path.to_string()), backed);
     if let Some(view) = loaded.view.filter(|_| s.prefs.timeline.restore_open_sequences) {
         s.restore_project_view(view);
@@ -4958,19 +4969,29 @@ fn recover(s: &mut Session, id: Option<&str>) -> Result<Value> {
 /// `None` when the project has no unsaved changes. When the unsaved changes cannot be kept, the
 /// replacement is refused unless `discard` says to drop them; with `discard` a snapshot is still taken
 /// when it can be, and a failure to take it is ignored (#3621).
-fn snapshot_if_dirty(s: &Session, discard: bool) -> Result<Option<String>> {
+fn snapshot_if_dirty(s: &mut Session, discard: bool) -> Result<Option<String>> {
     // The browser has neither the native clock nor the native filesystem (its own recovery snapshots cover it).
     if cfg!(target_arch = "wasm32") || !s.is_dirty() {
         return Ok(None);
     }
     match snapshot_dirty(s) {
-        Ok(Some(path)) => Ok(Some(path)),
+        Ok(Some(path)) => {
+            // remembered, so `file.listAutoSaves` may list the replaced project's versions from there
+            if let Some(dir) = std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf)
+                && !s.snapshot_dirs.contains(&dir)
+            {
+                s.snapshot_dirs.push(dir);
+                let extra = s.snapshot_dirs.len().saturating_sub(16);
+                s.snapshot_dirs.drain(..extra);
+            }
+            Ok(Some(path))
+        }
         Ok(None) if discard => Ok(None),
-        Ok(None) => Err(EngineError::Other(
+        Ok(None) => Err(EngineError::UnsavedChanges(
             "the project has unsaved changes and nowhere to keep a copy of them: save it first, or pass `discard: true` to drop them".into(),
         )),
         Err(_) if discard => Ok(None),
-        Err(e) => Err(EngineError::Other(format!("{e}; pass `discard: true` to drop the unsaved changes anyway"))),
+        Err(e) => Err(EngineError::UnsavedChanges(format!("{e}; pass `discard: true` to drop the unsaved changes anyway"))),
     }
 }
 

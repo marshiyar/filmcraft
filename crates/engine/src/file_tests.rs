@@ -356,3 +356,40 @@ fn a_one_version_limit_keeps_the_snapshot_with_the_auto_save_worker_running() {
         assert!(std::path::Path::new(&snap).exists(), "round {n}: the snapshot {snap} survives the worker's rotation");
     }
 }
+
+#[test]
+fn the_demo_project_does_not_replace_unsaved_changes_silently() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let before = (*s.project).clone();
+    // nowhere to keep a copy: refused with the structured kind, nothing replaced
+    let e = s.execute("file.openDemoProject", json!({})).unwrap_err();
+    assert!(matches!(e, crate::EngineError::UnsavedChanges(_)), "{e:?}");
+    assert_eq!(*s.project, before);
+    // with an auto-save location the project is snapshotted first
+    let (mut t, _d) = snapshot_session("snap-demo");
+    t.execute("file.openDemoProject", json!({})).unwrap();
+    t.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let edited = (*t.project).clone();
+    let snap = t.execute("file.openDemoProject", json!({})).unwrap()["snapshot"].as_str().expect("snapshot path").to_string();
+    assert_eq!(filmcraft_format::decode(&std::fs::read(&snap).unwrap()).unwrap().project, edited);
+    // dropping the changes on purpose
+    s.execute("file.openDemoProject", json!({"discard": true})).unwrap();
+}
+
+#[test]
+fn list_auto_saves_lists_only_auto_save_folders() {
+    let (mut s, d) = snapshot_session("snap-list-dir");
+    let elsewhere = d.join("not-an-auto-save-folder");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("secret-2026-01-01_00-00-00-1767225600.fcproj"), b"x").unwrap();
+    let e = s.execute("file.listAutoSaves", json!({"name": "secret", "dir": elsewhere})).unwrap_err().to_string();
+    assert!(e.contains("auto-save folder"), "{e}");
+    // the current project's own folder and the one a snapshot went to are fine
+    s.execute("file.listAutoSaves", json!({})).unwrap();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let snap = std::path::PathBuf::from(s.execute("file.newProject", json!({"name": "Next"})).unwrap()["snapshot"].as_str().unwrap());
+    s.execute("file.listAutoSaves", json!({"name": "FilmCraft Demo", "dir": snap.parent().unwrap()})).unwrap();
+}
